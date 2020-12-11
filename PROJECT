@@ -1,0 +1,7 @@
+domain: fil.com
+layout: go.kubebuilder.io/v2
+projectName: endpoint-service-operator
+repo: github.com/FidelityInternational/endpoint-service-operator
+version: 3-alpha
+plugins:
+  go.sdk.operatorframework.io/v2-alpha: {}
