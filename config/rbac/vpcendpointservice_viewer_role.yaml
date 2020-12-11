@@ -1,0 +1,20 @@
+# permissions for end users to view vpcendpointservices.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vpcendpointservice-viewer-role
+rules:
+- apiGroups:
+  - vpc-endpoint-service.fil.com
+  resources:
+  - vpcendpointservices
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - vpc-endpoint-service.fil.com
+  resources:
+  - vpcendpointservices/status
+  verbs:
+  - get
