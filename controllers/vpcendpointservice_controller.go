@@ -40,8 +40,7 @@ type VpcEndpointServiceReconciler struct {
 func (r *VpcEndpointServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	_ = context.Background()
 	_ = r.Log.WithValues("vpcendpointservice", req.NamespacedName)
-
-	// your logic here
+	_ = r.Log.WithValues("vpcendpointservice", "Hello world. I'm alive!")
 
 	return ctrl.Result{}, nil
 }
