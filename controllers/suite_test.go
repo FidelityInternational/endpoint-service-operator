@@ -20,15 +20,17 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/go-logr/logr"
+	"github.com/go-logr/zapr"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"go.uber.org/zap"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/envtest/printer"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	vpcendpointservicev1alpha1 "github.com/FidelityInternational/endpoint-service-operator/api/v1alpha1"
 	// +kubebuilder:scaffold:imports
@@ -50,14 +52,19 @@ func TestAPIs(t *testing.T) {
 }
 
 var _ = BeforeSuite(func(done Done) {
-	logf.SetLogger(zap.LoggerTo(GinkgoWriter, true))
+	// logf.SetLogger(zap.LoggerTo(GinkgoWriter, true))
+	var log logr.Logger
+
+	zapLog, err := zap.NewDevelopment()
+	Expect(err).ToNot(HaveOccurred())
+	log = zapr.NewLogger(zapLog)
+	logf.SetLogger(log)
 
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
 		CRDDirectoryPaths: []string{filepath.Join("..", "config", "crd", "bases")},
 	}
 
-	var err error
 	cfg, err = testEnv.Start()
 	Expect(err).ToNot(HaveOccurred())
 	Expect(cfg).ToNot(BeNil())

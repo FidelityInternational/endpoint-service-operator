@@ -18,13 +18,13 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/go-logr/logr"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	vpcendpointservicev1alpha1 "github.com/FidelityInternational/endpoint-service-operator/api/v1alpha1"
 )
 
 // VpcEndpointServiceReconciler reconciles a VpcEndpointService object
@@ -37,16 +37,12 @@ type VpcEndpointServiceReconciler struct {
 // +kubebuilder:rbac:groups=vpc-endpoint-service.fil.com,resources=vpcendpointservices,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=vpc-endpoint-service.fil.com,resources=vpcendpointservices/status,verbs=get;update;patch
 
-func (r *VpcEndpointServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
-	_ = context.Background()
-	_ = r.Log.WithValues("vpcendpointservice", req.NamespacedName)
-	_ = r.Log.WithValues("vpcendpointservice", "Hello world. I'm alive!")
-
+func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	fmt.Printf("%#v\n", req)
 	return ctrl.Result{}, nil
 }
 
 func (r *VpcEndpointServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&vpcendpointservicev1alpha1.VpcEndpointService{}).
-		Complete(r)
+	controller := ctrl.NewControllerManagedBy(mgr).For(&v1.Service{}).Complete(r)
+	return controller
 }
