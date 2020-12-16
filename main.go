@@ -37,6 +37,8 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
+const controllerName = "VpcEndpointService"
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
@@ -70,10 +72,10 @@ func main() {
 
 	if err = (&controllers.VpcEndpointServiceReconciler{
 		Client: mgr.GetClient(),
-		Log:    ctrl.Log.WithName("controllers").WithName("VpcEndpointService"),
+		Log:    ctrl.Log.WithName("controllers").WithName(controllerName),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "VpcEndpointService")
+		setupLog.Error(err, "unable to create controller", "controller", controllerName)
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

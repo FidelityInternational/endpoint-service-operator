@@ -18,13 +18,14 @@ package controllers
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
 // VpcEndpointServiceReconciler reconciles a VpcEndpointService object
@@ -37,12 +38,64 @@ type VpcEndpointServiceReconciler struct {
 // +kubebuilder:rbac:groups=vpc-endpoint-service.fil.com,resources=vpcendpointservices,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=vpc-endpoint-service.fil.com,resources=vpcendpointservices/status,verbs=get;update;patch
 
+func ignoreNonLoadBalancerServicePredicate() predicate.Predicate {
+	return predicate.Funcs{
+		GenericFunc: func(e event.GenericEvent) bool {
+			o := e.Object.(*v1.Service)
+			if o.Spec.Type != "LoadBalancer" {
+				return false
+			}
+			return true
+		},
+		CreateFunc: func(e event.CreateEvent) bool {
+			obj, ok := e.Object.(*v1.Service)
+			if !ok {
+				return false
+			}
+			if obj.Spec.Type != "LoadBalancer" {
+				return false
+			}
+			return true
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			if e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() {
+				return false
+			}
+			obj, ok := e.ObjectNew.(*v1.Service)
+			if !ok {
+				return false
+			}
+			if obj.Spec.Type != "LoadBalancer" {
+				return false
+			}
+			return true
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			obj, ok := e.Object.(*v1.Service)
+			if !ok {
+				return false
+			}
+			if obj.Spec.Type != "LoadBalancer" {
+				return false
+			}
+			return true
+		},
+	}
+}
+
 func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	fmt.Printf("%#v\n", req)
+	svc := v1.Service{}
+	err := r.Client.Get(ctx, req.NamespacedName, &svc)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{}, nil
 }
 
 func (r *VpcEndpointServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	controller := ctrl.NewControllerManagedBy(mgr).For(&v1.Service{}).Complete(r)
+	controller := ctrl.NewControllerManagedBy(mgr).
+		For(&v1.Service{}).
+		WithEventFilter(ignoreNonLoadBalancerServicePredicate()).
+		Complete(r)
 	return controller
 }
