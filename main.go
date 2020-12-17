@@ -29,6 +29,8 @@ import (
 
 	vpcendpointservicev1alpha1 "github.com/FidelityInternational/endpoint-service-operator/api/v1alpha1"
 	"github.com/FidelityInternational/endpoint-service-operator/controllers"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/elbv2"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -70,7 +72,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Builds new AWS session and service connection for LB queries
+	svc := elbv2.New(session.New())
+
 	if err = (&controllers.VpcEndpointServiceReconciler{
+		Svc:    svc,
 		Client: mgr.GetClient(),
 		Log:    ctrl.Log.WithName("controllers").WithName(controllerName),
 		Scheme: mgr.GetScheme(),

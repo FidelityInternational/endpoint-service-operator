@@ -4,6 +4,7 @@ go 1.15
 
 require (
 	cloud.google.com/go v0.74.0 // indirect
+	github.com/aws/aws-sdk-go v1.27.0
 	github.com/cenkalti/backoff/v4 v4.1.0
 	github.com/go-logr/logr v0.3.0
 	github.com/go-logr/zapr v0.3.0

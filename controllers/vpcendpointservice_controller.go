@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/aws/aws-sdk-go/service/elbv2"
 	backoff "github.com/cenkalti/backoff/v4"
 	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
@@ -36,11 +37,12 @@ const (
 	DefaultRandomizationFactor = 0.5
 	DefaultMultiplier          = 1.5
 	DefaultMaxInterval         = 60 * time.Second
-	DefaultMaxElapsedTime      = 20 * time.Second
+	DefaultMaxElapsedTime      = 1 * time.Second
 )
 
 // VpcEndpointServiceReconciler reconciles a VpcEndpointService object
 type VpcEndpointServiceReconciler struct {
+	Svc *elbv2.ELBV2
 	client.Client
 	Log    logr.Logger
 	Scheme *runtime.Scheme
@@ -124,6 +126,20 @@ func (r *VpcEndpointServiceReconciler) waitForLoadBalancer(service v1.Service) (
 	return err
 }
 
+func (r *VpcEndpointServiceReconciler) DescribeLoadbalancers() (*elbv2.DescribeLoadBalancersOutput, error) {
+	input := &elbv2.DescribeLoadBalancersInput{}
+	return r.Svc.DescribeLoadBalancers(input)
+}
+
+func GetLoadBalancerByHostname(hostname string, loadBalancers *elbv2.DescribeLoadBalancersOutput) (*elbv2.LoadBalancer, error) {
+	for _, lb := range loadBalancers.LoadBalancers {
+		if *lb.DNSName == hostname {
+			return lb, nil
+		}
+	}
+	return nil, fmt.Errorf("LB with hostname %s not found on AWS", hostname)
+}
+
 func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	svc := v1.Service{}
 	err := r.Client.Get(ctx, req.NamespacedName, &svc)
@@ -133,7 +149,27 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 	err = r.waitForLoadBalancer(svc)
 	if err != nil {
 		r.Log.Info(fmt.Sprintf("Error waiting for LB to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String()))
+		// We don't return error as this makes controller to re-queue
+		return ctrl.Result{}, nil
 	}
+	awsLoadBalancers, err := r.DescribeLoadbalancers()
+	if err != nil {
+		r.Log.Info(fmt.Sprintf("Error describing LoadBalancers: %s", err.Error()))
+		// We don't return error as this makes controller to re-queue
+		return ctrl.Result{}, nil
+	}
+	var loadBalancers []*elbv2.LoadBalancer
+	for _, lb := range svc.Status.LoadBalancer.Ingress {
+		loadBalancer, err := GetLoadBalancerByHostname(lb.Hostname, awsLoadBalancers)
+		if err != nil {
+			r.Log.Info(fmt.Sprintf("LB with name: %s not found on AWS", err.Error()))
+			// We don't return error as this makes controller to re-queue
+			continue
+		}
+		loadBalancers = append(loadBalancers, loadBalancer)
+	}
+
+	fmt.Printf("%#v\n", loadBalancers)
 	return ctrl.Result{}, nil
 }
 
