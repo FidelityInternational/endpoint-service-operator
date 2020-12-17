@@ -18,7 +18,10 @@ package controllers
 
 import (
 	"context"
+	"fmt"
+	"time"
 
+	backoff "github.com/cenkalti/backoff/v4"
 	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -26,6 +29,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+)
+
+const (
+	DefaultInitialInterval     = 500 * time.Millisecond
+	DefaultRandomizationFactor = 0.5
+	DefaultMultiplier          = 1.5
+	DefaultMaxInterval         = 60 * time.Second
+	DefaultMaxElapsedTime      = 20 * time.Second
 )
 
 // VpcEndpointServiceReconciler reconciles a VpcEndpointService object
@@ -83,11 +94,45 @@ func ignoreNonLoadBalancerServicePredicate() predicate.Predicate {
 	}
 }
 
+func (r *VpcEndpointServiceReconciler) waitForLoadBalancer(service v1.Service) (err error) {
+	b := &backoff.ExponentialBackOff{
+		InitialInterval:     DefaultInitialInterval,
+		RandomizationFactor: DefaultRandomizationFactor,
+		Multiplier:          DefaultMultiplier,
+		MaxInterval:         DefaultMaxInterval,
+		MaxElapsedTime:      DefaultMaxElapsedTime,
+		Stop:                backoff.Stop,
+		Clock:               backoff.SystemClock,
+	}
+
+	operation := func(service v1.Service) func() (err error) {
+		return func() (err error) {
+			err_message := fmt.Sprintf("Loadbalancer for service %s is not initialised", service.ObjectMeta.Name)
+			if service.Status.LoadBalancer.Ingress == nil {
+				r.Log.Info(err_message)
+				return fmt.Errorf(err_message)
+			}
+			for _, ingress := range service.Status.LoadBalancer.Ingress {
+				if ingress.Hostname == "" {
+					return fmt.Errorf(err_message)
+				}
+			}
+			return nil
+		}
+	}(service)
+	err = backoff.Retry(operation, b)
+	return err
+}
+
 func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	svc := v1.Service{}
 	err := r.Client.Get(ctx, req.NamespacedName, &svc)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+	err = r.waitForLoadBalancer(svc)
+	if err != nil {
+		r.Log.Info(fmt.Sprintf("Error waiting for LB to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String()))
 	}
 	return ctrl.Result{}, nil
 }
