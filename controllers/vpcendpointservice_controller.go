@@ -44,24 +44,49 @@ const (
 	DefaultMaxElapsedTime      = 1 * time.Second
 )
 
+var (
+	VpcID = "fake"
+)
+
 // VpcEndpointServiceReconciler reconciles a VpcEndpointService object
 type VpcEndpointServiceReconciler struct {
-	ElbSvc *elbv2.ELBV2
-	Ec2Svc *ec2.EC2
+	ElbSvc  *elbv2.ELBV2
+	Ec2Svc  *ec2.EC2
+	VpcID   *string
+	Subnets []*ec2.Subnet
 	client.Client
 	Log    logr.Logger
 	Scheme *runtime.Scheme
 }
 
-func NewVpcEndpointServiceReconciler(mgr manager.Manager, log logr.Logger) *VpcEndpointServiceReconciler {
+func NewVpcEndpointServiceReconciler(mgr manager.Manager, log logr.Logger) (*VpcEndpointServiceReconciler, error) {
 	session := session.Must(session.NewSession())
-	return &VpcEndpointServiceReconciler{
-		ElbSvc: elbv2.New(session),
-		Ec2Svc: ec2.New(session),
-		Client: mgr.GetClient(),
-		Log:    log,
-		Scheme: mgr.GetScheme(),
+	ec2Svc := ec2.New(session)
+	filterName := "vpc-id"
+	filterValue := []*string{&VpcID}
+	filter := ec2.Filter{
+		Name:   &filterName,
+		Values: filterValue,
 	}
+
+	input := ec2.DescribeSubnetsInput{
+		Filters: []*ec2.Filter{&filter},
+	}
+
+	subnets, err := ec2Svc.DescribeSubnets(&input)
+	if err != nil {
+		return nil, err
+	}
+
+	return &VpcEndpointServiceReconciler{
+		ElbSvc:  elbv2.New(session),
+		Ec2Svc:  ec2Svc,
+		VpcID:   &VpcID,
+		Client:  mgr.GetClient(),
+		Log:     log,
+		Scheme:  mgr.GetScheme(),
+		Subnets: subnets.Subnets,
+	}, nil
 }
 
 // +kubebuilder:rbac:groups=vpc-endpoint-service.fil.com,resources=vpcendpointservices,verbs=get;list;watch;create;update;patch;delete
@@ -194,7 +219,7 @@ func (r *VpcEndpointServiceReconciler) getSvcLoadBalancersFromAWS(svc v1.Service
 	return loadBalancers, nil
 }
 
-func (r *VpcEndpointServiceReconciler) createVpcEndpointService(lbARNs []*string) error {
+func (r *VpcEndpointServiceReconciler) createVpcEndpointService(lbARNs []*string) (*ec2.CreateVpcEndpointServiceConfigurationOutput, error) {
 	clientToken := uuid.New().String()
 	AcceptanceRequired := false
 
@@ -203,13 +228,30 @@ func (r *VpcEndpointServiceReconciler) createVpcEndpointService(lbARNs []*string
 		ClientToken:             &clientToken,
 		NetworkLoadBalancerArns: lbARNs,
 	}
-	output, err := r.Ec2Svc.CreateVpcEndpointServiceConfiguration(&input)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("%#v\n", output)
-	return nil
+	return r.Ec2Svc.CreateVpcEndpointServiceConfiguration(&input)
+}
 
+func (r *VpcEndpointServiceReconciler) createVpcEndpoint(serviceName *string) (*ec2.CreateVpcEndpointOutput, error) {
+	clientToken := uuid.New().String()
+	privateDnsEnabled := false
+	subnetIds := []*string{}
+	VpcEndpointType := "Interface"
+	for _, subnet := range r.Subnets {
+		subnetIds = append(subnetIds, subnet.SubnetId)
+	}
+	input := ec2.CreateVpcEndpointInput{
+		ClientToken:       &clientToken,
+		PrivateDnsEnabled: &privateDnsEnabled,
+		ServiceName:       serviceName,
+		SubnetIds:         subnetIds,
+		VpcEndpointType:   &VpcEndpointType,
+		VpcId:             r.VpcID,
+	}
+	output, err := r.Ec2Svc.CreateVpcEndpoint(&input)
+	if err != nil {
+		return nil, err
+	}
+	return output, nil
 }
 
 //Variadic function ;)
@@ -237,10 +279,16 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 	if err != nil {
 		return r.handleReconcileError("error getting load balancer ARN, %s", err.Error())
 	}
-	err = r.createVpcEndpointService(arns)
+	endpointService, err := r.createVpcEndpointService(arns)
 	if err != nil {
 		return r.handleReconcileError("error creating VPC endpoint service, %s", err.Error())
 	}
+	time.Sleep(5 * time.Second)
+	output, err := r.createVpcEndpoint(endpointService.ServiceConfiguration.ServiceName)
+	if err != nil {
+		return r.handleReconcileError("error creating VPC endpoint service, %s", err.Error())
+	}
+	r.Log.Info(fmt.Sprintf("Endpoint service %s created", *output.VpcEndpoint.ServiceName))
 	return ctrl.Result{}, nil
 }
 

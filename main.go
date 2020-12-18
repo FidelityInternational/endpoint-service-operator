@@ -70,7 +70,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	reconciler := controllers.NewVpcEndpointServiceReconciler(mgr, ctrl.Log.WithName("controllers").WithName(controllerName))
+	reconciler, err := controllers.NewVpcEndpointServiceReconciler(mgr, ctrl.Log.WithName("controllers").WithName(controllerName))
+	if err != nil {
+		setupLog.Error(err, "unable to start reconciler")
+		os.Exit(1)
+	}
 
 	if err = reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", controllerName)
