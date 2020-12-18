@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/elbv2"
 	backoff "github.com/cenkalti/backoff/v4"
 	"github.com/go-logr/logr"
@@ -29,6 +31,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
@@ -42,10 +45,22 @@ const (
 
 // VpcEndpointServiceReconciler reconciles a VpcEndpointService object
 type VpcEndpointServiceReconciler struct {
-	Svc *elbv2.ELBV2
+	ElbSvc *elbv2.ELBV2
+	Ec2Svc *ec2.EC2
 	client.Client
 	Log    logr.Logger
 	Scheme *runtime.Scheme
+}
+
+func NewVpcEndpointServiceReconciler(mgr manager.Manager, log logr.Logger) *VpcEndpointServiceReconciler {
+	session := session.Must(session.NewSession())
+	return &VpcEndpointServiceReconciler{
+		ElbSvc: elbv2.New(session),
+		Ec2Svc: ec2.New(session),
+		Client: mgr.GetClient(),
+		Log:    log,
+		Scheme: mgr.GetScheme(),
+	}
 }
 
 // +kubebuilder:rbac:groups=vpc-endpoint-service.fil.com,resources=vpcendpointservices,verbs=get;list;watch;create;update;patch;delete
@@ -128,7 +143,7 @@ func (r *VpcEndpointServiceReconciler) waitForLoadBalancer(service v1.Service) (
 
 func (r *VpcEndpointServiceReconciler) describeLoadbalancers() (*elbv2.DescribeLoadBalancersOutput, error) {
 	input := &elbv2.DescribeLoadBalancersInput{}
-	return r.Svc.DescribeLoadBalancers(input)
+	return r.ElbSvc.DescribeLoadBalancers(input)
 }
 
 func getLoadBalancerByHostname(hostname string, loadBalancers *elbv2.DescribeLoadBalancersOutput) (*elbv2.LoadBalancer, error) {
@@ -140,6 +155,29 @@ func getLoadBalancerByHostname(hostname string, loadBalancers *elbv2.DescribeLoa
 	return nil, fmt.Errorf("LB with hostname %s not found on AWS", hostname)
 }
 
+func (r *VpcEndpointServiceReconciler) getSvcLoadBalancersFromAWS(svc v1.Service) (loadBalancers []*elbv2.LoadBalancer, err error) {
+	awsLoadBalancers, err := r.describeLoadbalancers()
+	if err != nil {
+		r.Log.Info(fmt.Sprintf("error describing LoadBalancers: %s", err.Error()))
+		return nil, fmt.Errorf("error describing LoadBalancers: %s", err.Error())
+	}
+	for _, lb := range svc.Status.LoadBalancer.Ingress {
+		loadBalancer, err := getLoadBalancerByHostname(lb.Hostname, awsLoadBalancers)
+		if err != nil {
+			r.Log.Info(fmt.Sprintf("LB with name %s not found on AWS", err.Error()))
+		}
+		loadBalancers = append(loadBalancers, loadBalancer)
+	}
+	if len(loadBalancers) == 0 {
+		return nil, fmt.Errorf("no matching LB found")
+	}
+	return loadBalancers, nil
+}
+
+func (r *VpcEndpointServiceReconciler) CreateVpcEndpointServiceConfiguration() {
+
+}
+
 func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	svc := v1.Service{}
 	err := r.Client.Get(ctx, req.NamespacedName, &svc)
@@ -148,27 +186,16 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 	err = r.waitForLoadBalancer(svc)
 	if err != nil {
-		r.Log.Info(fmt.Sprintf("Error waiting for LB to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String()))
+		r.Log.Info(fmt.Sprintf("error waiting for LB to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String()))
 		// We don't return error as this makes controller to re-queue
 		return ctrl.Result{}, nil
 	}
-	awsLoadBalancers, err := r.describeLoadbalancers()
+	loadBalancers, err := r.getSvcLoadBalancersFromAWS(svc)
 	if err != nil {
-		r.Log.Info(fmt.Sprintf("Error describing LoadBalancers: %s", err.Error()))
+		r.Log.Info(fmt.Sprintf("error: can't provision endpoint for %s load balancer. %s", svc.Name, err.Error()))
 		// We don't return error as this makes controller to re-queue
 		return ctrl.Result{}, nil
 	}
-	var loadBalancers []*elbv2.LoadBalancer
-	for _, lb := range svc.Status.LoadBalancer.Ingress {
-		loadBalancer, err := getLoadBalancerByHostname(lb.Hostname, awsLoadBalancers)
-		if err != nil {
-			r.Log.Info(fmt.Sprintf("LB with name: %s not found on AWS", err.Error()))
-			// We don't return error as this makes controller to re-queue
-			continue
-		}
-		loadBalancers = append(loadBalancers, loadBalancer)
-	}
-
 	fmt.Printf("%#v\n", loadBalancers)
 	return ctrl.Result{}, nil
 }
