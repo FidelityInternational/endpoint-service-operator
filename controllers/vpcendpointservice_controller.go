@@ -26,6 +26,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/elbv2"
 	backoff "github.com/cenkalti/backoff/v4"
 	"github.com/go-logr/logr"
+	"github.com/google/uuid"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -155,6 +156,25 @@ func getLoadBalancerByHostname(hostname string, loadBalancers *elbv2.DescribeLoa
 	return nil, fmt.Errorf("LB with hostname %s not found on AWS", hostname)
 }
 
+func getLoadBalancerARN(lb *elbv2.LoadBalancer) (*string, error) {
+	if *lb.LoadBalancerArn == "" {
+		return nil, fmt.Errorf("%s ARN is empty", *lb.LoadBalancerName)
+	}
+	return lb.LoadBalancerArn, nil
+}
+
+func getLoadBalancerARNs(lbs []*elbv2.LoadBalancer) ([]*string, error) {
+	var arns []*string
+	for _, lb := range lbs {
+		arn, err := getLoadBalancerARN(lb)
+		if err != nil {
+			return nil, err
+		}
+		arns = append(arns, arn)
+	}
+	return arns, nil
+}
+
 func (r *VpcEndpointServiceReconciler) getSvcLoadBalancersFromAWS(svc v1.Service) (loadBalancers []*elbv2.LoadBalancer, err error) {
 	awsLoadBalancers, err := r.describeLoadbalancers()
 	if err != nil {
@@ -174,7 +194,21 @@ func (r *VpcEndpointServiceReconciler) getSvcLoadBalancersFromAWS(svc v1.Service
 	return loadBalancers, nil
 }
 
-func (r *VpcEndpointServiceReconciler) CreateVpcEndpointServiceConfiguration() {
+func (r *VpcEndpointServiceReconciler) CreateVpcEndpointServiceConfiguration(lbARNs []*string) error {
+	clientToken := uuid.New().String()
+	AcceptanceRequired := false
+
+	input := ec2.CreateVpcEndpointServiceConfigurationInput{
+		AcceptanceRequired:      &AcceptanceRequired,
+		ClientToken:             &clientToken,
+		NetworkLoadBalancerArns: lbARNs,
+	}
+	output, err := r.Ec2Svc.CreateVpcEndpointServiceConfiguration(&input)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%#v\n", output)
+	return nil
 
 }
 
@@ -196,7 +230,18 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 		// We don't return error as this makes controller to re-queue
 		return ctrl.Result{}, nil
 	}
-	fmt.Printf("%#v\n", loadBalancers)
+	arns, err := getLoadBalancerARNs(loadBalancers)
+	if err != nil {
+		r.Log.Info(err.Error())
+		// We don't return error as this makes controller to re-queue
+		return ctrl.Result{}, nil
+	}
+	err = r.CreateVpcEndpointServiceConfiguration(arns)
+	if err != nil {
+		r.Log.Info(err.Error())
+		// We don't return error as this makes controller to re-queue
+		return ctrl.Result{}, nil
+	}
 	return ctrl.Result{}, nil
 }
 

@@ -9,6 +9,7 @@ require (
 	github.com/go-logr/logr v0.3.0
 	github.com/go-logr/zapr v0.3.0
 	github.com/google/gofuzz v1.2.0 // indirect
+	github.com/google/uuid v1.1.2
 	github.com/googleapis/gnostic v0.5.3 // indirect
 	github.com/imdario/mergo v0.3.11 // indirect
 	github.com/onsi/ginkgo v1.14.1
