@@ -189,12 +189,12 @@ func (r *VpcEndpointServiceReconciler) getSvcLoadBalancersFromAWS(svc v1.Service
 		loadBalancers = append(loadBalancers, loadBalancer)
 	}
 	if len(loadBalancers) == 0 {
-		return nil, fmt.Errorf("no matching LB found")
+		return nil, fmt.Errorf("no matching LBs found for %s", svc.Name)
 	}
 	return loadBalancers, nil
 }
 
-func (r *VpcEndpointServiceReconciler) CreateVpcEndpointServiceConfiguration(lbARNs []*string) error {
+func (r *VpcEndpointServiceReconciler) createVpcEndpointService(lbARNs []*string) error {
 	clientToken := uuid.New().String()
 	AcceptanceRequired := false
 
@@ -212,6 +212,13 @@ func (r *VpcEndpointServiceReconciler) CreateVpcEndpointServiceConfiguration(lbA
 
 }
 
+//Variadic function ;)
+func (r *VpcEndpointServiceReconciler) handleReconcileError(format string, params ...interface{}) (ctrl.Result, error) {
+	r.Log.Info(fmt.Sprintf(format, params...))
+	// We don't return error as this makes controller to re-queue
+	return ctrl.Result{}, nil
+}
+
 func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	svc := v1.Service{}
 	err := r.Client.Get(ctx, req.NamespacedName, &svc)
@@ -220,27 +227,19 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 	err = r.waitForLoadBalancer(svc)
 	if err != nil {
-		r.Log.Info(fmt.Sprintf("error waiting for LB to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String()))
-		// We don't return error as this makes controller to re-queue
-		return ctrl.Result{}, nil
+		return r.handleReconcileError("error waiting for LB to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String())
 	}
 	loadBalancers, err := r.getSvcLoadBalancersFromAWS(svc)
 	if err != nil {
-		r.Log.Info(fmt.Sprintf("error: can't provision endpoint for %s load balancer. %s", svc.Name, err.Error()))
-		// We don't return error as this makes controller to re-queue
-		return ctrl.Result{}, nil
+		return r.handleReconcileError("error: can't provision endpoint for %s load balancer. %s", svc.Name, err.Error())
 	}
 	arns, err := getLoadBalancerARNs(loadBalancers)
 	if err != nil {
-		r.Log.Info(err.Error())
-		// We don't return error as this makes controller to re-queue
-		return ctrl.Result{}, nil
+		return r.handleReconcileError("error getting load balancer ARN, %s", err.Error())
 	}
-	err = r.CreateVpcEndpointServiceConfiguration(arns)
+	err = r.createVpcEndpointService(arns)
 	if err != nil {
-		r.Log.Info(err.Error())
-		// We don't return error as this makes controller to re-queue
-		return ctrl.Result{}, nil
+		return r.handleReconcileError("error creating VPC endpoint service, %s", err.Error())
 	}
 	return ctrl.Result{}, nil
 }
