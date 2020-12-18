@@ -126,12 +126,12 @@ func (r *VpcEndpointServiceReconciler) waitForLoadBalancer(service v1.Service) (
 	return err
 }
 
-func (r *VpcEndpointServiceReconciler) DescribeLoadbalancers() (*elbv2.DescribeLoadBalancersOutput, error) {
+func (r *VpcEndpointServiceReconciler) describeLoadbalancers() (*elbv2.DescribeLoadBalancersOutput, error) {
 	input := &elbv2.DescribeLoadBalancersInput{}
 	return r.Svc.DescribeLoadBalancers(input)
 }
 
-func GetLoadBalancerByHostname(hostname string, loadBalancers *elbv2.DescribeLoadBalancersOutput) (*elbv2.LoadBalancer, error) {
+func getLoadBalancerByHostname(hostname string, loadBalancers *elbv2.DescribeLoadBalancersOutput) (*elbv2.LoadBalancer, error) {
 	for _, lb := range loadBalancers.LoadBalancers {
 		if *lb.DNSName == hostname {
 			return lb, nil
@@ -152,7 +152,7 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 		// We don't return error as this makes controller to re-queue
 		return ctrl.Result{}, nil
 	}
-	awsLoadBalancers, err := r.DescribeLoadbalancers()
+	awsLoadBalancers, err := r.describeLoadbalancers()
 	if err != nil {
 		r.Log.Info(fmt.Sprintf("Error describing LoadBalancers: %s", err.Error()))
 		// We don't return error as this makes controller to re-queue
@@ -160,7 +160,7 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 	var loadBalancers []*elbv2.LoadBalancer
 	for _, lb := range svc.Status.LoadBalancer.Ingress {
-		loadBalancer, err := GetLoadBalancerByHostname(lb.Hostname, awsLoadBalancers)
+		loadBalancer, err := getLoadBalancerByHostname(lb.Hostname, awsLoadBalancers)
 		if err != nil {
 			r.Log.Info(fmt.Sprintf("LB with name: %s not found on AWS", err.Error()))
 			// We don't return error as this makes controller to re-queue
