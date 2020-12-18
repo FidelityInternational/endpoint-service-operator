@@ -10,7 +10,6 @@ require (
 	github.com/go-logr/zapr v0.3.0
 	github.com/google/gofuzz v1.2.0 // indirect
 	github.com/googleapis/gnostic v0.5.3 // indirect
-	github.com/gophercloud/gophercloud v0.1.0 // indirect
 	github.com/imdario/mergo v0.3.11 // indirect
 	github.com/onsi/ginkgo v1.14.1
 	github.com/onsi/gomega v1.10.2
@@ -27,7 +26,5 @@ require (
 	k8s.io/apiextensions-apiserver v0.20.0 // indirect
 	k8s.io/apimachinery v0.20.0
 	k8s.io/client-go v0.20.0
-	k8s.io/klog v1.0.0 // indirect
 	sigs.k8s.io/controller-runtime v0.7.0
-	sigs.k8s.io/structured-merge-diff/v3 v3.0.0 // indirect
 )
