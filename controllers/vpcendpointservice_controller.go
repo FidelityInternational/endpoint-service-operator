@@ -21,9 +21,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/elbv2"
+	"github.com/aws/aws-sdk-go/service/route53"
 	backoff "github.com/cenkalti/backoff/v4"
 	"github.com/go-logr/logr"
 	"github.com/google/uuid"
@@ -37,34 +39,39 @@ import (
 )
 
 const (
-	DefaultInitialInterval     = 500 * time.Millisecond
-	DefaultRandomizationFactor = 0.5
-	DefaultMultiplier          = 1.5
-	DefaultMaxInterval         = 60 * time.Second
-	DefaultMaxElapsedTime      = 1 * time.Second
-	vpcEndpointAnnotation      = "vpc-endpoint-service-operator.fil.com/endpoint-vpc-id"
+	DefaultInitialInterval         = 500 * time.Millisecond
+	DefaultRandomizationFactor     = 0.5
+	DefaultMultiplier              = 1.5
+	DefaultMaxInterval             = 60 * time.Second
+	DefaultMaxElapsedTime          = 1 * time.Second
+	endpointAnnotationVpcID        = "vpc-endpoint-service-operator.fil.com/endpoint-vpc-id"
+	endpointAnnotationHostname     = "vpc-endpoint-service-operator.fil.com/hostname"
+	endpointAnnotationHostedZoneID = "vpc-endpoint-service-operator.fil.com/hosted-zone-id"
 )
 
 // VpcEndpointServiceReconciler reconciles a VpcEndpointService object
 type VpcEndpointServiceReconciler struct {
-	ElbSvc *elbv2.ELBV2
-	Ec2Svc *ec2.EC2
-	VpcID  *string
+	ElbSvc     *elbv2.ELBV2
+	Ec2Svc     *ec2.EC2
+	Route53Svc *route53.Route53
 	client.Client
 	Log    logr.Logger
 	Scheme *runtime.Scheme
 }
 
+// NewVpcEndpointServiceReconciler creates default reconsiler
 func NewVpcEndpointServiceReconciler(mgr manager.Manager, log logr.Logger) (*VpcEndpointServiceReconciler, error) {
 	session := session.Must(session.NewSession())
 	ec2Svc := ec2.New(session)
+	route53Svc := route53.New(session)
 
 	return &VpcEndpointServiceReconciler{
-		ElbSvc: elbv2.New(session),
-		Ec2Svc: ec2Svc,
-		Client: mgr.GetClient(),
-		Log:    log,
-		Scheme: mgr.GetScheme(),
+		ElbSvc:     elbv2.New(session),
+		Ec2Svc:     ec2Svc,
+		Route53Svc: route53Svc,
+		Client:     mgr.GetClient(),
+		Log:        log,
+		Scheme:     mgr.GetScheme(),
 	}, nil
 }
 
@@ -210,13 +217,13 @@ func (r *VpcEndpointServiceReconciler) createVpcEndpointService(lbARNs []*string
 	return r.Ec2Svc.CreateVpcEndpointServiceConfiguration(&input)
 }
 
-func (r *VpcEndpointServiceReconciler) createVpcEndpoint(serviceName *string) (*ec2.CreateVpcEndpointOutput, error) {
+func (r *VpcEndpointServiceReconciler) createVpcEndpoint(vpcID, serviceName *string) (*ec2.CreateVpcEndpointOutput, error) {
 	clientToken := uuid.New().String()
-	privateDnsEnabled := false
+	privateDNSEnabled := false
 	subnetIds := []*string{}
 	VpcEndpointType := "Interface"
 	filterName := "vpc-id"
-	filterValue := []*string{r.VpcID}
+	filterValue := []*string{vpcID}
 	filter := ec2.Filter{
 		Name:   &filterName,
 		Values: filterValue,
@@ -237,11 +244,11 @@ func (r *VpcEndpointServiceReconciler) createVpcEndpoint(serviceName *string) (*
 
 	createVpcEndpointInput := ec2.CreateVpcEndpointInput{
 		ClientToken:       &clientToken,
-		PrivateDnsEnabled: &privateDnsEnabled,
+		PrivateDnsEnabled: &privateDNSEnabled,
 		ServiceName:       serviceName,
 		SubnetIds:         subnetIds,
 		VpcEndpointType:   &VpcEndpointType,
-		VpcId:             r.VpcID,
+		VpcId:             vpcID,
 	}
 	output, err := r.Ec2Svc.CreateVpcEndpoint(&createVpcEndpointInput)
 	if err != nil {
@@ -257,19 +264,51 @@ func (r *VpcEndpointServiceReconciler) handleReconcileError(format string, param
 	return ctrl.Result{}, nil
 }
 
+func (r *VpcEndpointServiceReconciler) createDNSRecord(hostname, hostedZoneID *string, vpcEndpoint *ec2.CreateVpcEndpointOutput) (*route53.ChangeResourceRecordSetsOutput, error) {
+
+	input := &route53.ChangeResourceRecordSetsInput{
+		ChangeBatch: &route53.ChangeBatch{
+			Changes: []*route53.Change{
+				{
+					Action: aws.String("CREATE"),
+					ResourceRecordSet: &route53.ResourceRecordSet{
+						AliasTarget: &route53.AliasTarget{
+							DNSName:              aws.String(*vpcEndpoint.VpcEndpoint.DnsEntries[0].DnsName),
+							EvaluateTargetHealth: aws.Bool(false),
+							HostedZoneId:         aws.String(*vpcEndpoint.VpcEndpoint.DnsEntries[0].HostedZoneId),
+						},
+						Name: aws.String(*hostname),
+						Type: aws.String("A"),
+					},
+				},
+			},
+		},
+		HostedZoneId: aws.String(*hostedZoneID),
+	}
+	return r.Route53Svc.ChangeResourceRecordSets(input)
+}
+
 func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	svc := v1.Service{}
 	err := r.Client.Get(ctx, req.NamespacedName, &svc)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	var vpcID, hostname, hostedZoneID string
 	for key, value := range svc.Annotations {
-		if key == vpcEndpointAnnotation {
-			r.VpcID = &value
+		if key == endpointAnnotationVpcID {
+			vpcID = value
+		}
+		if key == endpointAnnotationHostname {
+			hostname = value
+		}
+		if key == endpointAnnotationHostedZoneID {
+			hostedZoneID = value
 		}
 	}
-	if r.VpcID == nil || *r.VpcID == "" {
-		return r.handleReconcileError("no endpoint service vpc id found in annotations, skipping service %s", svc.Name)
+
+	if vpcID == "" {
+		return r.handleReconcileError("no endpoint vpc id found in annotations, skipping service %s", svc.Name)
 	}
 	err = r.waitForLoadBalancer(svc)
 	if err != nil {
@@ -288,12 +327,19 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return r.handleReconcileError("error creating VPC endpoint service, %s, service name: %s", err.Error(), svc.Name)
 	}
 	time.Sleep(5 * time.Second)
-	output, err := r.createVpcEndpoint(endpointService.ServiceConfiguration.ServiceName)
+	createVpcEndpointOutput, err := r.createVpcEndpoint(&vpcID, endpointService.ServiceConfiguration.ServiceName)
 	if err != nil {
 		return r.handleReconcileError("error creating VPC endpoint service, %s", err.Error())
 	}
-	r.Log.Info(fmt.Sprintf("Endpoint service %s created", *output.VpcEndpoint.ServiceName))
-
+	r.Log.Info(fmt.Sprintf("Endpoint service %s created", *createVpcEndpointOutput.VpcEndpoint.ServiceName))
+	if hostname == "" || hostedZoneID == "" {
+		return r.handleReconcileError("no endpoint vpc id found in annotations, skipping service %s", svc.Name)
+	}
+	_, err = r.createDNSRecord(&hostname, &hostedZoneID, createVpcEndpointOutput)
+	if err != nil {
+		return r.handleReconcileError("error creating DNS record for endpoint %s, %s", *createVpcEndpointOutput.VpcEndpoint.VpcEndpointId, err.Error())
+	}
+	r.Log.Info(fmt.Sprintf("DNS record service %s created", hostname))
 	return ctrl.Result{}, nil
 }
 
