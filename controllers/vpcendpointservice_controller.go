@@ -42,18 +42,14 @@ const (
 	DefaultMultiplier          = 1.5
 	DefaultMaxInterval         = 60 * time.Second
 	DefaultMaxElapsedTime      = 1 * time.Second
-)
-
-var (
-	VpcID = "fake"
+	vpcEndpointAnnotation      = "vpc-endpoint-service-operator.fil.com/endpoint-vpc-id"
 )
 
 // VpcEndpointServiceReconciler reconciles a VpcEndpointService object
 type VpcEndpointServiceReconciler struct {
-	ElbSvc  *elbv2.ELBV2
-	Ec2Svc  *ec2.EC2
-	VpcID   *string
-	Subnets []*ec2.Subnet
+	ElbSvc *elbv2.ELBV2
+	Ec2Svc *ec2.EC2
+	VpcID  *string
 	client.Client
 	Log    logr.Logger
 	Scheme *runtime.Scheme
@@ -62,30 +58,13 @@ type VpcEndpointServiceReconciler struct {
 func NewVpcEndpointServiceReconciler(mgr manager.Manager, log logr.Logger) (*VpcEndpointServiceReconciler, error) {
 	session := session.Must(session.NewSession())
 	ec2Svc := ec2.New(session)
-	filterName := "vpc-id"
-	filterValue := []*string{&VpcID}
-	filter := ec2.Filter{
-		Name:   &filterName,
-		Values: filterValue,
-	}
-
-	input := ec2.DescribeSubnetsInput{
-		Filters: []*ec2.Filter{&filter},
-	}
-
-	subnets, err := ec2Svc.DescribeSubnets(&input)
-	if err != nil {
-		return nil, err
-	}
 
 	return &VpcEndpointServiceReconciler{
-		ElbSvc:  elbv2.New(session),
-		Ec2Svc:  ec2Svc,
-		VpcID:   &VpcID,
-		Client:  mgr.GetClient(),
-		Log:     log,
-		Scheme:  mgr.GetScheme(),
-		Subnets: subnets.Subnets,
+		ElbSvc: elbv2.New(session),
+		Ec2Svc: ec2Svc,
+		Client: mgr.GetClient(),
+		Log:    log,
+		Scheme: mgr.GetScheme(),
 	}, nil
 }
 
@@ -150,14 +129,14 @@ func (r *VpcEndpointServiceReconciler) waitForLoadBalancer(service v1.Service) (
 
 	operation := func(service v1.Service) func() (err error) {
 		return func() (err error) {
-			err_message := fmt.Sprintf("Loadbalancer for service %s is not initialised", service.ObjectMeta.Name)
+			errMessage := fmt.Sprintf("Loadbalancer for service %s is not initialised", service.ObjectMeta.Name)
 			if service.Status.LoadBalancer.Ingress == nil {
-				r.Log.Info(err_message)
-				return fmt.Errorf(err_message)
+				r.Log.Info(errMessage)
+				return fmt.Errorf(errMessage)
 			}
 			for _, ingress := range service.Status.LoadBalancer.Ingress {
 				if ingress.Hostname == "" {
-					return fmt.Errorf(err_message)
+					return fmt.Errorf(errMessage)
 				}
 			}
 			return nil
@@ -236,10 +215,27 @@ func (r *VpcEndpointServiceReconciler) createVpcEndpoint(serviceName *string) (*
 	privateDnsEnabled := false
 	subnetIds := []*string{}
 	VpcEndpointType := "Interface"
-	for _, subnet := range r.Subnets {
+	filterName := "vpc-id"
+	filterValue := []*string{r.VpcID}
+	filter := ec2.Filter{
+		Name:   &filterName,
+		Values: filterValue,
+	}
+
+	describeSubnetsInput := ec2.DescribeSubnetsInput{
+		Filters: []*ec2.Filter{&filter},
+	}
+
+	subnets, err := r.Ec2Svc.DescribeSubnets(&describeSubnetsInput)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, subnet := range subnets.Subnets {
 		subnetIds = append(subnetIds, subnet.SubnetId)
 	}
-	input := ec2.CreateVpcEndpointInput{
+
+	createVpcEndpointInput := ec2.CreateVpcEndpointInput{
 		ClientToken:       &clientToken,
 		PrivateDnsEnabled: &privateDnsEnabled,
 		ServiceName:       serviceName,
@@ -247,7 +243,7 @@ func (r *VpcEndpointServiceReconciler) createVpcEndpoint(serviceName *string) (*
 		VpcEndpointType:   &VpcEndpointType,
 		VpcId:             r.VpcID,
 	}
-	output, err := r.Ec2Svc.CreateVpcEndpoint(&input)
+	output, err := r.Ec2Svc.CreateVpcEndpoint(&createVpcEndpointInput)
 	if err != nil {
 		return nil, err
 	}
@@ -267,6 +263,14 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	for key, value := range svc.Annotations {
+		if key == vpcEndpointAnnotation {
+			r.VpcID = &value
+		}
+	}
+	if r.VpcID == nil || *r.VpcID == "" {
+		return r.handleReconcileError("no endpoint service vpc id found in annotations, skipping service %s", svc.Name)
+	}
 	err = r.waitForLoadBalancer(svc)
 	if err != nil {
 		return r.handleReconcileError("error waiting for LB to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String())
@@ -281,7 +285,7 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 	endpointService, err := r.createVpcEndpointService(arns)
 	if err != nil {
-		return r.handleReconcileError("error creating VPC endpoint service, %s", err.Error())
+		return r.handleReconcileError("error creating VPC endpoint service, %s, service name: %s", err.Error(), svc.Name)
 	}
 	time.Sleep(5 * time.Second)
 	output, err := r.createVpcEndpoint(endpointService.ServiceConfiguration.ServiceName)
@@ -289,6 +293,7 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return r.handleReconcileError("error creating VPC endpoint service, %s", err.Error())
 	}
 	r.Log.Info(fmt.Sprintf("Endpoint service %s created", *output.VpcEndpoint.ServiceName))
+
 	return ctrl.Result{}, nil
 }
 
