@@ -38,12 +38,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
+// Defaults for exponential backoff and Istio service annotation keys
 const (
 	DefaultInitialInterval         = 500 * time.Millisecond
 	DefaultRandomizationFactor     = 0.5
 	DefaultMultiplier              = 1.5
-	DefaultMaxInterval             = 60 * time.Second
-	DefaultMaxElapsedTime          = 1 * time.Second
+	DefaultMaxInterval             = 15 * time.Second
+	DefaultMaxElapsedTime          = 320 * time.Second
 	endpointAnnotationVpcID        = "vpc-endpoint-service-operator.fil.com/endpoint-vpc-id"
 	endpointAnnotationHostname     = "vpc-endpoint-service-operator.fil.com/hostname"
 	endpointAnnotationHostedZoneID = "vpc-endpoint-service-operator.fil.com/hosted-zone-id"
@@ -217,6 +218,7 @@ func (r *VpcEndpointServiceReconciler) createVpcEndpointService(lbARNs []*string
 	return r.Ec2Svc.CreateVpcEndpointServiceConfiguration(&input)
 }
 
+// func (c *EC2) CreateVpcEndpoint(input *CreateVpcEndpointInput) (*CreateVpcEndpointOutput, error)
 func (r *VpcEndpointServiceReconciler) createVpcEndpoint(vpcID, serviceName *string) (*ec2.CreateVpcEndpointOutput, error) {
 	clientToken := uuid.New().String()
 	privateDNSEnabled := false
@@ -255,6 +257,86 @@ func (r *VpcEndpointServiceReconciler) createVpcEndpoint(vpcID, serviceName *str
 		return nil, err
 	}
 	return output, nil
+}
+
+func (r *VpcEndpointServiceReconciler) waitForVpcEndpointService(endpointServiceOutput *ec2.CreateVpcEndpointServiceConfigurationOutput) (err error) {
+	b := &backoff.ExponentialBackOff{
+		InitialInterval:     DefaultInitialInterval,
+		RandomizationFactor: DefaultRandomizationFactor,
+		Multiplier:          DefaultMultiplier,
+		MaxInterval:         DefaultMaxInterval,
+		MaxElapsedTime:      DefaultMaxElapsedTime,
+		Stop:                backoff.Stop,
+		Clock:               backoff.SystemClock,
+	}
+
+	vpcEndpointServiceID := endpointServiceOutput.ServiceConfiguration.ServiceId
+
+	operation := func(vpcEndpointServiceID *string) func() (err error) {
+		return func() (err error) {
+			describeVpcEndpointServiceConfigurationsInput := ec2.DescribeVpcEndpointServiceConfigurationsInput{
+				ServiceIds: []*string{vpcEndpointServiceID},
+			}
+
+			vpcEndpointServiceConfigurationOutput, err := r.Ec2Svc.DescribeVpcEndpointServiceConfigurations(&describeVpcEndpointServiceConfigurationsInput)
+
+			var vpcEndpointServiceState string
+
+			for _, endpointService := range vpcEndpointServiceConfigurationOutput.ServiceConfigurations {
+				vpcEndpointServiceState = *endpointService.ServiceState
+			}
+
+			errMessage := fmt.Sprintf("Vpc endpoint service is %s", vpcEndpointServiceState)
+			fmt.Printf("vpcEndpointService state: %s\n", vpcEndpointServiceState)
+			if vpcEndpointServiceState != "Available" {
+				r.Log.Info(errMessage)
+				return fmt.Errorf(errMessage)
+			}
+			return nil
+		}
+	}(vpcEndpointServiceID)
+	err = backoff.Retry(operation, b)
+	return err
+}
+
+func (r *VpcEndpointServiceReconciler) waitForVpcEndpoint(endpointOutput *ec2.CreateVpcEndpointOutput) (err error) {
+	b := &backoff.ExponentialBackOff{
+		InitialInterval:     DefaultInitialInterval,
+		RandomizationFactor: DefaultRandomizationFactor,
+		Multiplier:          DefaultMultiplier,
+		MaxInterval:         DefaultMaxInterval,
+		MaxElapsedTime:      DefaultMaxElapsedTime,
+		Stop:                backoff.Stop,
+		Clock:               backoff.SystemClock,
+	}
+
+	vpcEndpointid := endpointOutput.VpcEndpoint.VpcEndpointId
+
+	operation := func(vpcEndpointid *string) func() (err error) {
+		return func() (err error) {
+
+			describeVpcEndpointsInput := ec2.DescribeVpcEndpointsInput{
+				VpcEndpointIds: []*string{vpcEndpointid},
+			}
+			vpcEndpointsOutput, err := r.Ec2Svc.DescribeVpcEndpoints(&describeVpcEndpointsInput)
+
+			var vpcEndpointState string
+
+			for _, endpoint := range vpcEndpointsOutput.VpcEndpoints {
+				vpcEndpointState = *endpoint.State
+			}
+
+			errMessage := fmt.Sprintf("VPC Endpoint is %s", vpcEndpointState)
+			fmt.Printf("vpcEndpoint state: %s\n", vpcEndpointState)
+			if vpcEndpointState != "available" {
+				r.Log.Info(errMessage)
+				return fmt.Errorf(errMessage)
+			}
+			return nil
+		}
+	}(vpcEndpointid)
+	err = backoff.Retry(operation, b)
+	return err
 }
 
 //Variadic function ;)
@@ -326,10 +408,18 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 	if err != nil {
 		return r.handleReconcileError("error creating VPC endpoint service, %s, service name: %s", err.Error(), svc.Name)
 	}
+	err = r.waitForVpcEndpointService(endpointService)
+	if err != nil {
+		return r.handleReconcileError("error waiting for VPC endpoint service to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String())
+	}
 	time.Sleep(5 * time.Second)
 	createVpcEndpointOutput, err := r.createVpcEndpoint(&vpcID, endpointService.ServiceConfiguration.ServiceName)
 	if err != nil {
 		return r.handleReconcileError("error creating VPC endpoint service, %s", err.Error())
+	}
+	err = r.waitForVpcEndpoint(createVpcEndpointOutput)
+	if err != nil {
+		return r.handleReconcileError("error waiting for VPC endpoint to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String())
 	}
 	r.Log.Info(fmt.Sprintf("Endpoint service %s created", *createVpcEndpointOutput.VpcEndpoint.ServiceName))
 	if hostname == "" || hostedZoneID == "" {
