@@ -19,6 +19,8 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -218,7 +220,6 @@ func (r *VpcEndpointServiceReconciler) createVpcEndpointService(lbARNs []*string
 	return r.Ec2Svc.CreateVpcEndpointServiceConfiguration(&input)
 }
 
-// func (c *EC2) CreateVpcEndpoint(input *CreateVpcEndpointInput) (*CreateVpcEndpointOutput, error)
 func (r *VpcEndpointServiceReconciler) createVpcEndpoint(vpcID, serviceName *string) (*ec2.CreateVpcEndpointOutput, error) {
 	clientToken := uuid.New().String()
 	privateDNSEnabled := false
@@ -229,6 +230,16 @@ func (r *VpcEndpointServiceReconciler) createVpcEndpoint(vpcID, serviceName *str
 	filter := ec2.Filter{
 		Name:   &filterName,
 		Values: filterValue,
+	}
+
+	b := &backoff.ExponentialBackOff{
+		InitialInterval:     DefaultInitialInterval,
+		RandomizationFactor: DefaultRandomizationFactor,
+		Multiplier:          DefaultMultiplier,
+		MaxInterval:         DefaultMaxInterval,
+		MaxElapsedTime:      DefaultMaxElapsedTime,
+		Stop:                backoff.Stop,
+		Clock:               backoff.SystemClock,
 	}
 
 	describeSubnetsInput := ec2.DescribeSubnetsInput{
@@ -252,14 +263,28 @@ func (r *VpcEndpointServiceReconciler) createVpcEndpoint(vpcID, serviceName *str
 		VpcEndpointType:   &VpcEndpointType,
 		VpcId:             vpcID,
 	}
-	output, err := r.Ec2Svc.CreateVpcEndpoint(&createVpcEndpointInput)
+	var output *ec2.CreateVpcEndpointOutput
+	operation := func(createVpcEndpointInput *ec2.CreateVpcEndpointInput) func() (err error) {
+		return func() (err error) {
+			output, err = r.Ec2Svc.CreateVpcEndpoint(createVpcEndpointInput)
+			if err != nil {
+				if strings.Contains(err.Error(), "Unavailable: The service is unavailable. Please try again shortly.") {
+					r.Log.Info(err.Error())
+					return err
+				}
+				return backoff.Permanent(err)
+			}
+			return nil
+		}
+	}(&createVpcEndpointInput)
+	err = backoff.Retry(operation, b)
 	if err != nil {
 		return nil, err
 	}
 	return output, nil
 }
 
-func (r *VpcEndpointServiceReconciler) waitForVpcEndpointService(endpointServiceOutput *ec2.CreateVpcEndpointServiceConfigurationOutput) (err error) {
+func (r *VpcEndpointServiceReconciler) waitForVpcEndpointService(vpcEndpointServiceID *string) (err error) {
 	b := &backoff.ExponentialBackOff{
 		InitialInterval:     DefaultInitialInterval,
 		RandomizationFactor: DefaultRandomizationFactor,
@@ -269,8 +294,6 @@ func (r *VpcEndpointServiceReconciler) waitForVpcEndpointService(endpointService
 		Stop:                backoff.Stop,
 		Clock:               backoff.SystemClock,
 	}
-
-	vpcEndpointServiceID := endpointServiceOutput.ServiceConfiguration.ServiceId
 
 	operation := func(vpcEndpointServiceID *string) func() (err error) {
 		return func() (err error) {
@@ -281,16 +304,13 @@ func (r *VpcEndpointServiceReconciler) waitForVpcEndpointService(endpointService
 			vpcEndpointServiceConfigurationOutput, err := r.Ec2Svc.DescribeVpcEndpointServiceConfigurations(&describeVpcEndpointServiceConfigurationsInput)
 
 			var vpcEndpointServiceState string
-
 			for _, endpointService := range vpcEndpointServiceConfigurationOutput.ServiceConfigurations {
 				vpcEndpointServiceState = *endpointService.ServiceState
-			}
-
-			errMessage := fmt.Sprintf("Vpc endpoint service is %s", vpcEndpointServiceState)
-			fmt.Printf("vpcEndpointService state: %s\n", vpcEndpointServiceState)
-			if vpcEndpointServiceState != "Available" {
-				r.Log.Info(errMessage)
-				return fmt.Errorf(errMessage)
+				errMessage := fmt.Sprintf("Vpc endpoint service is %s", vpcEndpointServiceState)
+				if strings.ToLower(vpcEndpointServiceState) != "available" {
+					r.Log.Info(errMessage)
+					return fmt.Errorf(errMessage)
+				}
 			}
 			return nil
 		}
@@ -299,7 +319,7 @@ func (r *VpcEndpointServiceReconciler) waitForVpcEndpointService(endpointService
 	return err
 }
 
-func (r *VpcEndpointServiceReconciler) waitForVpcEndpoint(endpointOutput *ec2.CreateVpcEndpointOutput) (err error) {
+func (r *VpcEndpointServiceReconciler) waitForVpcEndpoint(vpcEndpointid *string) (err error) {
 	b := &backoff.ExponentialBackOff{
 		InitialInterval:     DefaultInitialInterval,
 		RandomizationFactor: DefaultRandomizationFactor,
@@ -309,8 +329,6 @@ func (r *VpcEndpointServiceReconciler) waitForVpcEndpoint(endpointOutput *ec2.Cr
 		Stop:                backoff.Stop,
 		Clock:               backoff.SystemClock,
 	}
-
-	vpcEndpointid := endpointOutput.VpcEndpoint.VpcEndpointId
 
 	operation := func(vpcEndpointid *string) func() (err error) {
 		return func() (err error) {
@@ -323,14 +341,11 @@ func (r *VpcEndpointServiceReconciler) waitForVpcEndpoint(endpointOutput *ec2.Cr
 			var vpcEndpointState string
 
 			for _, endpoint := range vpcEndpointsOutput.VpcEndpoints {
-				vpcEndpointState = *endpoint.State
-			}
-
-			errMessage := fmt.Sprintf("VPC Endpoint is %s", vpcEndpointState)
-			fmt.Printf("vpcEndpoint state: %s\n", vpcEndpointState)
-			if vpcEndpointState != "available" {
-				r.Log.Info(errMessage)
-				return fmt.Errorf(errMessage)
+				errMessage := fmt.Sprintf("VPC Endpoint %s is %s", *endpoint.VpcEndpointId, *endpoint.State)
+				if strings.ToLower(vpcEndpointState) != "available" {
+					r.Log.Info(errMessage)
+					return fmt.Errorf(errMessage)
+				}
 			}
 			return nil
 		}
@@ -389,9 +404,6 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 	}
 
-	if vpcID == "" {
-		return r.handleReconcileError("no endpoint vpc id found in annotations, skipping service %s", svc.Name)
-	}
 	err = r.waitForLoadBalancer(svc)
 	if err != nil {
 		return r.handleReconcileError("error waiting for LB to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String())
@@ -408,26 +420,31 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 	if err != nil {
 		return r.handleReconcileError("error creating VPC endpoint service, %s, service name: %s", err.Error(), svc.Name)
 	}
-	err = r.waitForVpcEndpointService(endpointService)
+	err = r.waitForVpcEndpointService(endpointService.ServiceConfiguration.ServiceId)
 	if err != nil {
 		return r.handleReconcileError("error waiting for VPC endpoint service to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String())
 	}
-	time.Sleep(5 * time.Second)
-	createVpcEndpointOutput, err := r.createVpcEndpoint(&vpcID, endpointService.ServiceConfiguration.ServiceName)
-	if err != nil {
-		return r.handleReconcileError("error creating VPC endpoint service, %s", err.Error())
+	r.Log.Info(fmt.Sprintf("Endpoint service %s created", *endpointService.ServiceConfiguration.ServiceName))
+
+	if vpcID == "" {
+		return r.handleReconcileError("no endpoint vpc id found in annotations, skipping service %s", svc.Name)
 	}
-	err = r.waitForVpcEndpoint(createVpcEndpointOutput)
+	vpcEndpoint, err := r.createVpcEndpoint(&vpcID, endpointService.ServiceConfiguration.ServiceName)
+	if err != nil {
+		return r.handleReconcileError("error creating VPC endpoint, %s", err.Error())
+	}
+	err = r.waitForVpcEndpoint(vpcEndpoint.VpcEndpoint.VpcEndpointId)
 	if err != nil {
 		return r.handleReconcileError("error waiting for VPC endpoint to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String())
 	}
-	r.Log.Info(fmt.Sprintf("Endpoint service %s created", *createVpcEndpointOutput.VpcEndpoint.ServiceName))
+	r.Log.Info(fmt.Sprintf("Endpoint %s created", *vpcEndpoint.VpcEndpoint.ServiceName))
 	if hostname == "" || hostedZoneID == "" {
 		return r.handleReconcileError("no endpoint vpc id found in annotations, skipping service %s", svc.Name)
 	}
-	_, err = r.createDNSRecord(&hostname, &hostedZoneID, createVpcEndpointOutput)
+	os.Exit(0)
+	_, err = r.createDNSRecord(&hostname, &hostedZoneID, vpcEndpoint)
 	if err != nil {
-		return r.handleReconcileError("error creating DNS record for endpoint %s, %s", *createVpcEndpointOutput.VpcEndpoint.VpcEndpointId, err.Error())
+		return r.handleReconcileError("error creating DNS record for endpoint %s, %s", *vpcEndpoint.VpcEndpoint.VpcEndpointId, err.Error())
 	}
 	r.Log.Info(fmt.Sprintf("DNS record service %s created", hostname))
 	return ctrl.Result{}, nil
