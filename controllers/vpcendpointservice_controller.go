@@ -26,6 +26,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/aws/aws-sdk-go/service/eks"
 	"github.com/aws/aws-sdk-go/service/elbv2"
 	"github.com/aws/aws-sdk-go/service/route53"
 	backoff "github.com/cenkalti/backoff/v4"
@@ -58,16 +59,28 @@ type VpcEndpointServiceReconciler struct {
 	Ec2Svc     *ec2.EC2
 	Route53Svc *route53.Route53
 	client.Client
-	Log    logr.Logger
-	Scheme *runtime.Scheme
+	Log     logr.Logger
+	Scheme  *runtime.Scheme
+	Cluster *eks.Cluster
 }
 
 // NewVpcEndpointServiceReconciler creates default reconsiler
-func NewVpcEndpointServiceReconciler(mgr manager.Manager, log logr.Logger) (*VpcEndpointServiceReconciler, error) {
+func NewVpcEndpointServiceReconciler(mgr manager.Manager, log logr.Logger, clusterName *string) (*VpcEndpointServiceReconciler, error) {
 	session := session.Must(session.NewSession())
 	ec2Svc := ec2.New(session)
 	route53Svc := route53.New(session)
-
+	eksSvc := eks.New(session)
+	hostname := mgr.GetConfig().Host
+	var cluster *eks.Cluster
+	if *clusterName == "" {
+		var err error
+		cluster, err = getClusterName(&hostname, eksSvc)
+		if err != nil {
+			cluster = &eks.Cluster{
+				Name: &hostname,
+			}
+		}
+	}
 	return &VpcEndpointServiceReconciler{
 		ElbSvc:     elbv2.New(session),
 		Ec2Svc:     ec2Svc,
@@ -75,7 +88,31 @@ func NewVpcEndpointServiceReconciler(mgr manager.Manager, log logr.Logger) (*Vpc
 		Client:     mgr.GetClient(),
 		Log:        log,
 		Scheme:     mgr.GetScheme(),
+		Cluster:    cluster,
 	}, nil
+}
+
+func getClusterName(hostname *string, svc *eks.EKS) (*eks.Cluster, error) {
+	input := &eks.ListClustersInput{}
+
+	clusters, err := svc.ListClusters(input)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, clusterName := range clusters.Clusters {
+		input := &eks.DescribeClusterInput{
+			Name: aws.String(*clusterName),
+		}
+		cluster, err := svc.DescribeCluster(input)
+		if err != nil {
+			return nil, err
+		}
+		if *cluster.Cluster.Endpoint == *hostname {
+			return cluster.Cluster, nil
+		}
+	}
+	return nil, fmt.Errorf("No cluster found on AWS")
 }
 
 // +kubebuilder:rbac:groups=vpc-endpoint-service.fil.com,resources=vpcendpointservices,verbs=get;list;watch;create;update;patch;delete
@@ -208,16 +245,63 @@ func (r *VpcEndpointServiceReconciler) getSvcLoadBalancersFromAWS(svc v1.Service
 	return loadBalancers, nil
 }
 
-func (r *VpcEndpointServiceReconciler) createVpcEndpointService(lbARNs []*string) (*ec2.CreateVpcEndpointServiceConfigurationOutput, error) {
+func (r *VpcEndpointServiceReconciler) createVpcEndpointService(lbARNs []*string, serviceName *string) (*ec2.ServiceConfiguration, error) {
 	clientToken := uuid.New().String()
 	AcceptanceRequired := false
-
+	NameKey := "Name"
+	ServiceKey := "Service"
+	resourceType := "vpc-endpoint-service"
 	input := ec2.CreateVpcEndpointServiceConfigurationInput{
 		AcceptanceRequired:      &AcceptanceRequired,
 		ClientToken:             &clientToken,
 		NetworkLoadBalancerArns: lbARNs,
+		TagSpecifications: []*ec2.TagSpecification{
+			{
+				ResourceType: &resourceType,
+				Tags: []*ec2.Tag{
+					{
+						Key:   &NameKey,
+						Value: r.Cluster.Name,
+					},
+					{
+						Key:   &ServiceKey,
+						Value: serviceName,
+					},
+				},
+			},
+		},
 	}
-	return r.Ec2Svc.CreateVpcEndpointServiceConfiguration(&input)
+	output, err := r.Ec2Svc.CreateVpcEndpointServiceConfiguration(&input)
+	if err != nil {
+		return nil, err
+	}
+	return output.ServiceConfiguration, nil
+}
+
+func (r *VpcEndpointServiceReconciler) getVpcEndpointService(serviceName *string) (*ec2.ServiceConfiguration, error) {
+	clusterFilterName := "tag:Name"
+	clusterFilterValue := []*string{r.Cluster.Name}
+	clusterFilter := ec2.Filter{
+		Name:   &clusterFilterName,
+		Values: clusterFilterValue,
+	}
+	serviceFilterName := "tag:Service"
+	serviceFilterValue := []*string{serviceName}
+	serviceFilter := ec2.Filter{
+		Name:   &serviceFilterName,
+		Values: serviceFilterValue,
+	}
+	input := &ec2.DescribeVpcEndpointServiceConfigurationsInput{
+		Filters: []*ec2.Filter{&clusterFilter, &serviceFilter},
+	}
+	vpcEndpointService, err := r.Ec2Svc.DescribeVpcEndpointServiceConfigurations(input)
+	if err != nil {
+		return nil, err
+	}
+	if vpcEndpointService.ServiceConfigurations == nil {
+		return nil, fmt.Errorf("No VPC Endpoint for service %s found", *serviceName)
+	}
+	return vpcEndpointService.ServiceConfigurations[0], nil
 }
 
 func (r *VpcEndpointServiceReconciler) createVpcEndpoint(vpcID, serviceName *string) (*ec2.CreateVpcEndpointOutput, error) {
@@ -416,20 +500,25 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 	if err != nil {
 		return r.handleReconcileError("error getting load balancer ARN, %s", err.Error())
 	}
-	endpointService, err := r.createVpcEndpointService(arns)
-	if err != nil {
-		return r.handleReconcileError("error creating VPC endpoint service, %s, service name: %s", err.Error(), svc.Name)
+	vpcEndpointService, err := r.getVpcEndpointService(&svc.Name)
+	if vpcEndpointService == nil || err != nil {
+		vpcEndpointService, err = r.createVpcEndpointService(arns, &svc.Name)
+		if err != nil {
+			return r.handleReconcileError("error creating VPC endpoint service, %s, service name: %s", err.Error(), svc.Name)
+		}
+		err = r.waitForVpcEndpointService(vpcEndpointService.ServiceId)
+		if err != nil {
+			return r.handleReconcileError("error waiting for VPC endpoint service to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String())
+		}
+		r.Log.Info(fmt.Sprintf("Endpoint service %s created", *vpcEndpointService.ServiceName))
+	} else {
+		r.Log.Info(fmt.Sprintf("VPC Endpoint service %s for kube service %s already exists", *vpcEndpointService.ServiceId, svc.Name))
 	}
-	err = r.waitForVpcEndpointService(endpointService.ServiceConfiguration.ServiceId)
-	if err != nil {
-		return r.handleReconcileError("error waiting for VPC endpoint service to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String())
-	}
-	r.Log.Info(fmt.Sprintf("Endpoint service %s created", *endpointService.ServiceConfiguration.ServiceName))
 
 	if vpcID == "" {
 		return r.handleReconcileError("no endpoint vpc id found in annotations, skipping service %s", svc.Name)
 	}
-	vpcEndpoint, err := r.createVpcEndpoint(&vpcID, endpointService.ServiceConfiguration.ServiceName)
+	vpcEndpoint, err := r.createVpcEndpoint(&vpcID, vpcEndpointService.ServiceName)
 	if err != nil {
 		return r.handleReconcileError("error creating VPC endpoint, %s", err.Error())
 	}

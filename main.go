@@ -49,10 +49,12 @@ func init() {
 func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
+	var clusterName string
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "enable-leader-election", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
+	flag.StringVar(&clusterName, "cluster-name", "", "Kubernetes cluster name")
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
@@ -70,7 +72,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	reconciler, err := controllers.NewVpcEndpointServiceReconciler(mgr, ctrl.Log.WithName("controllers").WithName(controllerName))
+	reconciler, err := controllers.NewVpcEndpointServiceReconciler(mgr, ctrl.Log.WithName("controllers").WithName(controllerName), &clusterName)
 	if err != nil {
 		setupLog.Error(err, "unable to start reconciler")
 		os.Exit(1)
