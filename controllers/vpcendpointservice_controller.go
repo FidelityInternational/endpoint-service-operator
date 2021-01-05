@@ -19,7 +19,6 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -299,12 +298,32 @@ func (r *VpcEndpointServiceReconciler) getVpcEndpointService(serviceName *string
 		return nil, err
 	}
 	if vpcEndpointService.ServiceConfigurations == nil {
-		return nil, fmt.Errorf("No VPC Endpoint for service %s found", *serviceName)
+		return nil, fmt.Errorf("No VPC Endpoint servuice for kube service %s found", *serviceName)
 	}
 	return vpcEndpointService.ServiceConfigurations[0], nil
 }
 
-func (r *VpcEndpointServiceReconciler) createVpcEndpoint(vpcID, serviceName *string) (*ec2.CreateVpcEndpointOutput, error) {
+func (r *VpcEndpointServiceReconciler) getVpcEndpoint(serviceName *string) (*ec2.VpcEndpoint, error) {
+	filterName := "service-id"
+	filterValue := []*string{serviceName}
+	filter := ec2.Filter{
+		Name:   &filterName,
+		Values: filterValue,
+	}
+	input := &ec2.DescribeVpcEndpointsInput{
+		Filters: []*ec2.Filter{&filter},
+	}
+	output, err := r.Ec2Svc.DescribeVpcEndpoints(input)
+	if err != nil {
+		return nil, err
+	}
+	if output.VpcEndpoints == nil {
+		return nil, fmt.Errorf("No VPC Endpoint for service %s found", *serviceName)
+	}
+	return output.VpcEndpoints[0], nil
+}
+
+func (r *VpcEndpointServiceReconciler) createVpcEndpoint(vpcID, serviceName *string, vpcEndpointService *ec2.ServiceConfiguration) (*ec2.VpcEndpoint, error) {
 	clientToken := uuid.New().String()
 	privateDNSEnabled := false
 	subnetIds := []*string{}
@@ -338,14 +357,31 @@ func (r *VpcEndpointServiceReconciler) createVpcEndpoint(vpcID, serviceName *str
 	for _, subnet := range subnets.Subnets {
 		subnetIds = append(subnetIds, subnet.SubnetId)
 	}
-
+	NameKey := "Name"
+	ServiceKey := "Service"
+	resourceType := "vpc-endpoint"
 	createVpcEndpointInput := ec2.CreateVpcEndpointInput{
 		ClientToken:       &clientToken,
 		PrivateDnsEnabled: &privateDNSEnabled,
-		ServiceName:       serviceName,
+		ServiceName:       vpcEndpointService.ServiceName,
 		SubnetIds:         subnetIds,
 		VpcEndpointType:   &VpcEndpointType,
 		VpcId:             vpcID,
+		TagSpecifications: []*ec2.TagSpecification{
+			{
+				ResourceType: &resourceType,
+				Tags: []*ec2.Tag{
+					{
+						Key:   &NameKey,
+						Value: r.Cluster.Name,
+					},
+					{
+						Key:   &ServiceKey,
+						Value: serviceName,
+					},
+				},
+			},
+		},
 	}
 	var output *ec2.CreateVpcEndpointOutput
 	operation := func(createVpcEndpointInput *ec2.CreateVpcEndpointInput) func() (err error) {
@@ -365,7 +401,7 @@ func (r *VpcEndpointServiceReconciler) createVpcEndpoint(vpcID, serviceName *str
 	if err != nil {
 		return nil, err
 	}
-	return output, nil
+	return output.VpcEndpoint, nil
 }
 
 func (r *VpcEndpointServiceReconciler) waitForVpcEndpointService(vpcEndpointServiceID *string) (err error) {
@@ -416,17 +452,13 @@ func (r *VpcEndpointServiceReconciler) waitForVpcEndpoint(vpcEndpointid *string)
 
 	operation := func(vpcEndpointid *string) func() (err error) {
 		return func() (err error) {
-
 			describeVpcEndpointsInput := ec2.DescribeVpcEndpointsInput{
 				VpcEndpointIds: []*string{vpcEndpointid},
 			}
 			vpcEndpointsOutput, err := r.Ec2Svc.DescribeVpcEndpoints(&describeVpcEndpointsInput)
-
-			var vpcEndpointState string
-
 			for _, endpoint := range vpcEndpointsOutput.VpcEndpoints {
-				errMessage := fmt.Sprintf("VPC Endpoint %s is %s", *endpoint.VpcEndpointId, *endpoint.State)
-				if strings.ToLower(vpcEndpointState) != "available" {
+				if strings.ToLower(*endpoint.State) != "available" {
+					errMessage := fmt.Sprintf("VPC Endpoint %s is %s", *endpoint.VpcEndpointId, *endpoint.State)
 					r.Log.Info(errMessage)
 					return fmt.Errorf(errMessage)
 				}
@@ -434,8 +466,7 @@ func (r *VpcEndpointServiceReconciler) waitForVpcEndpoint(vpcEndpointid *string)
 			return nil
 		}
 	}(vpcEndpointid)
-	err = backoff.Retry(operation, b)
-	return err
+	return backoff.Retry(operation, b)
 }
 
 //Variadic function ;)
@@ -445,7 +476,7 @@ func (r *VpcEndpointServiceReconciler) handleReconcileError(format string, param
 	return ctrl.Result{}, nil
 }
 
-func (r *VpcEndpointServiceReconciler) createDNSRecord(hostname, hostedZoneID *string, vpcEndpoint *ec2.CreateVpcEndpointOutput) (*route53.ChangeResourceRecordSetsOutput, error) {
+func (r *VpcEndpointServiceReconciler) createDNSRecord(hostname, hostedZoneID *string, vpcEndpoint *ec2.VpcEndpoint) (*route53.ChangeResourceRecordSetsOutput, error) {
 
 	input := &route53.ChangeResourceRecordSetsInput{
 		ChangeBatch: &route53.ChangeBatch{
@@ -454,9 +485,9 @@ func (r *VpcEndpointServiceReconciler) createDNSRecord(hostname, hostedZoneID *s
 					Action: aws.String("CREATE"),
 					ResourceRecordSet: &route53.ResourceRecordSet{
 						AliasTarget: &route53.AliasTarget{
-							DNSName:              aws.String(*vpcEndpoint.VpcEndpoint.DnsEntries[0].DnsName),
+							DNSName:              aws.String(*vpcEndpoint.DnsEntries[0].DnsName),
 							EvaluateTargetHealth: aws.Bool(false),
-							HostedZoneId:         aws.String(*vpcEndpoint.VpcEndpoint.DnsEntries[0].HostedZoneId),
+							HostedZoneId:         aws.String(*vpcEndpoint.DnsEntries[0].HostedZoneId),
 						},
 						Name: aws.String(*hostname),
 						Type: aws.String("A"),
@@ -469,6 +500,7 @@ func (r *VpcEndpointServiceReconciler) createDNSRecord(hostname, hostedZoneID *s
 	return r.Route53Svc.ChangeResourceRecordSets(input)
 }
 
+// Reconcile runs all logic related to the creation of endpoint services, endpoints and DNS records
 func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	svc := v1.Service{}
 	err := r.Client.Get(ctx, req.NamespacedName, &svc)
@@ -514,31 +546,34 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 	} else {
 		r.Log.Info(fmt.Sprintf("VPC Endpoint service %s for kube service %s already exists", *vpcEndpointService.ServiceId, svc.Name))
 	}
-
 	if vpcID == "" {
 		return r.handleReconcileError("no endpoint vpc id found in annotations, skipping service %s", svc.Name)
 	}
-	vpcEndpoint, err := r.createVpcEndpoint(&vpcID, vpcEndpointService.ServiceName)
-	if err != nil {
-		return r.handleReconcileError("error creating VPC endpoint, %s", err.Error())
+	vpcEndpoint, err := r.getVpcEndpoint(vpcEndpointService.ServiceName)
+
+	if vpcEndpoint == nil || err != nil {
+		vpcEndpoint, err := r.createVpcEndpoint(&vpcID, &svc.Name, vpcEndpointService)
+		if err != nil {
+			return r.handleReconcileError("error creating VPC endpoint, %s", err.Error())
+		}
+		err = r.waitForVpcEndpoint(vpcEndpoint.VpcEndpointId)
+		if err != nil {
+			return r.handleReconcileError("error waiting for VPC endpoint to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String())
+		}
+		r.Log.Info(fmt.Sprintf("VPC Endpoint %s created", *vpcEndpoint.VpcEndpointId))
 	}
-	err = r.waitForVpcEndpoint(vpcEndpoint.VpcEndpoint.VpcEndpointId)
-	if err != nil {
-		return r.handleReconcileError("error waiting for VPC endpoint to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String())
-	}
-	r.Log.Info(fmt.Sprintf("Endpoint %s created", *vpcEndpoint.VpcEndpoint.ServiceName))
 	if hostname == "" || hostedZoneID == "" {
 		return r.handleReconcileError("no endpoint vpc id found in annotations, skipping service %s", svc.Name)
 	}
-	os.Exit(0)
 	_, err = r.createDNSRecord(&hostname, &hostedZoneID, vpcEndpoint)
 	if err != nil {
-		return r.handleReconcileError("error creating DNS record for endpoint %s, %s", *vpcEndpoint.VpcEndpoint.VpcEndpointId, err.Error())
+		return r.handleReconcileError("error creating DNS record for endpoint %s, %s", *vpcEndpoint.VpcEndpointId, err.Error())
 	}
 	r.Log.Info(fmt.Sprintf("DNS record service %s created", hostname))
 	return ctrl.Result{}, nil
 }
 
+// SetupWithManager configures reconciler
 func (r *VpcEndpointServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	controller := ctrl.NewControllerManagedBy(mgr).
 		For(&v1.Service{}).
