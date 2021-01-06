@@ -46,7 +46,7 @@ const (
 	DefaultRandomizationFactor     = 0.5
 	DefaultMultiplier              = 1.5
 	DefaultMaxInterval             = 15 * time.Second
-	DefaultMaxElapsedTime          = 320 * time.Second
+	DefaultMaxElapsedTime          = 900 * time.Second
 	endpointAnnotationVpcID        = "vpc-endpoint-service-operator.fil.com/endpoint-vpc-id"
 	endpointAnnotationHostname     = "vpc-endpoint-service-operator.fil.com/hostname"
 	endpointAnnotationHostedZoneID = "vpc-endpoint-service-operator.fil.com/hosted-zone-id"
@@ -162,7 +162,18 @@ func ignoreNonLoadBalancerServicePredicate() predicate.Predicate {
 	}
 }
 
-func (r *VpcEndpointServiceReconciler) waitForLoadBalancer(service v1.Service) (err error) {
+func (r *VpcEndpointServiceReconciler) waitForLoadBalancer(service v1.Service) ([]*elbv2.LoadBalancer, error) {
+	errMessage := fmt.Sprintf("Loadbalancer for service %s is not initialised", service.ObjectMeta.Name)
+	if service.Status.LoadBalancer.Ingress == nil {
+		r.Log.Info(errMessage)
+		return nil, fmt.Errorf(errMessage)
+	}
+	for _, ingress := range service.Status.LoadBalancer.Ingress {
+		if ingress.Hostname == "" {
+			return nil, fmt.Errorf(errMessage)
+		}
+	}
+
 	b := &backoff.ExponentialBackOff{
 		InitialInterval:     DefaultInitialInterval,
 		RandomizationFactor: DefaultRandomizationFactor,
@@ -172,24 +183,25 @@ func (r *VpcEndpointServiceReconciler) waitForLoadBalancer(service v1.Service) (
 		Stop:                backoff.Stop,
 		Clock:               backoff.SystemClock,
 	}
-
+	var loadbalancers []*elbv2.LoadBalancer
 	operation := func(service v1.Service) func() (err error) {
 		return func() (err error) {
-			errMessage := fmt.Sprintf("Loadbalancer for service %s is not initialised", service.ObjectMeta.Name)
-			if service.Status.LoadBalancer.Ingress == nil {
-				r.Log.Info(errMessage)
-				return fmt.Errorf(errMessage)
+			loadbalancers, err = r.getLoadBalancers(service)
+			if err != nil {
+				return err
 			}
-			for _, ingress := range service.Status.LoadBalancer.Ingress {
-				if ingress.Hostname == "" {
+			for _, loadbalancer := range loadbalancers {
+				if strings.ToLower(*loadbalancer.State.Code) != "active" {
+					errMessage := fmt.Sprintf("Loadbalancer %s status is %s", *loadbalancer.LoadBalancerName, *loadbalancer.State.Code)
+					r.Log.Info(errMessage)
 					return fmt.Errorf(errMessage)
 				}
 			}
 			return nil
 		}
 	}(service)
-	err = backoff.Retry(operation, b)
-	return err
+	err := backoff.Retry(operation, b)
+	return loadbalancers, err
 }
 
 func (r *VpcEndpointServiceReconciler) describeLoadbalancers() (*elbv2.DescribeLoadBalancersOutput, error) {
@@ -225,7 +237,7 @@ func getLoadBalancerARNs(lbs []*elbv2.LoadBalancer) ([]*string, error) {
 	return arns, nil
 }
 
-func (r *VpcEndpointServiceReconciler) getSvcLoadBalancersFromAWS(svc v1.Service) (loadBalancers []*elbv2.LoadBalancer, err error) {
+func (r *VpcEndpointServiceReconciler) getLoadBalancers(svc v1.Service) (loadBalancers []*elbv2.LoadBalancer, err error) {
 	awsLoadBalancers, err := r.describeLoadbalancers()
 	if err != nil {
 		r.Log.Info(fmt.Sprintf("error describing LoadBalancers: %s", err.Error()))
@@ -298,7 +310,7 @@ func (r *VpcEndpointServiceReconciler) getVpcEndpointService(serviceName *string
 		return nil, err
 	}
 	if vpcEndpointService.ServiceConfigurations == nil {
-		return nil, fmt.Errorf("No VPC Endpoint servuice for kube service %s found", *serviceName)
+		return nil, fmt.Errorf("No VPC Endpoint service for kube service %s found", *serviceName)
 	}
 	return vpcEndpointService.ServiceConfigurations[0], nil
 }
@@ -317,7 +329,7 @@ func (r *VpcEndpointServiceReconciler) getVpcEndpoint(serviceName *string) (*ec2
 	if err != nil {
 		return nil, err
 	}
-	if output.VpcEndpoints == nil {
+	if output.VpcEndpoints == nil || *output.VpcEndpoints[0].State == "deleting" {
 		return nil, fmt.Errorf("No VPC Endpoint for service %s found", *serviceName)
 	}
 	return output.VpcEndpoints[0], nil
@@ -492,6 +504,11 @@ func (r *VpcEndpointServiceReconciler) waitForVpcEndpoint(vpcEndpointid *string)
 					r.Log.Info(errMessage)
 					return fmt.Errorf(errMessage)
 				}
+				if endpoint.DnsEntries[0].DnsName == nil || *endpoint.DnsEntries[0].DnsName == "" {
+					errMessage := fmt.Sprintf("VPC Endpoint %s DNS record is being provisioned", *endpoint.VpcEndpointId)
+					r.Log.Info(errMessage)
+					return fmt.Errorf(errMessage)
+				}
 			}
 			return nil
 		}
@@ -508,7 +525,6 @@ func (r *VpcEndpointServiceReconciler) handleReconcileError(format string, param
 
 func (r *VpcEndpointServiceReconciler) createDNSRecord(hostname, hostedZoneID, serviceName *string, vpcEndpoint *ec2.VpcEndpoint) (*route53.ChangeResourceRecordSetsOutput, error) {
 	tags := fmt.Sprintf("\"Owner=%s;Service=%s\"", *r.Cluster.Name, *serviceName)
-
 	input := &route53.ChangeResourceRecordSetsInput{
 		ChangeBatch: &route53.ChangeBatch{
 			Changes: []*route53.Change{
@@ -564,15 +580,11 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 	}
 
-	err = r.waitForLoadBalancer(svc)
+	loadbalancers, err := r.waitForLoadBalancer(svc)
 	if err != nil {
-		return r.handleReconcileError("error waiting for load balancer to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String())
+		return ctrl.Result{}, err
 	}
-	loadBalancers, err := r.getSvcLoadBalancersFromAWS(svc)
-	if err != nil {
-		return r.handleReconcileError("error can't provision VPC endpoint for %s load balancer. %s", svc.Name, err.Error())
-	}
-	arns, err := getLoadBalancerARNs(loadBalancers)
+	arns, err := getLoadBalancerARNs(loadbalancers)
 	if err != nil {
 		return r.handleReconcileError("error getting load balancer ARN, %s", err.Error())
 	}
@@ -597,7 +609,7 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	vpcEndpoint, err := r.getVpcEndpoint(vpcEndpointService.ServiceName)
 	if vpcEndpoint == nil || err != nil {
-		vpcEndpoint, err := r.createVpcEndpoint(&vpcID, &svc.Name, vpcEndpointService)
+		vpcEndpoint, err = r.createVpcEndpoint(&vpcID, &svc.Name, vpcEndpointService)
 		if err != nil {
 			return r.handleReconcileError("error creating VPC endpoint, %s", err.Error())
 		}
@@ -610,7 +622,7 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 		r.Log.Info(fmt.Sprintf("VPC Endpoint %s for kube service %s already exists", *vpcEndpoint.VpcEndpointId, svc.Name))
 	}
 	if hostname == "" || hostedZoneID == "" {
-		return r.handleReconcileError("no VPC endpoint ID found in annotations, skipping kube service %s", svc.Name)
+		return r.handleReconcileError("no VPC ID found in annotations, skipping kube service %s", svc.Name)
 	}
 
 	records, err := r.getDNSRecords(&hostname, &hostedZoneID)
