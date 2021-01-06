@@ -304,7 +304,7 @@ func (r *VpcEndpointServiceReconciler) getVpcEndpointService(serviceName *string
 }
 
 func (r *VpcEndpointServiceReconciler) getVpcEndpoint(serviceName *string) (*ec2.VpcEndpoint, error) {
-	filterName := "service-id"
+	filterName := "service-name"
 	filterValue := []*string{serviceName}
 	filter := ec2.Filter{
 		Name:   &filterName,
@@ -321,6 +321,36 @@ func (r *VpcEndpointServiceReconciler) getVpcEndpoint(serviceName *string) (*ec2
 		return nil, fmt.Errorf("No VPC Endpoint for service %s found", *serviceName)
 	}
 	return output.VpcEndpoints[0], nil
+}
+
+func (r *VpcEndpointServiceReconciler) getDNSRecords(hostname, hostedZoneID *string) ([]*route53.ResourceRecordSet, error) {
+	l := len(*hostname)
+	h := *hostname
+	var fullyQualifiedHostname string
+	if string(h[l-1]) != "." {
+		fullyQualifiedHostname = fmt.Sprintf("%s.", *hostname)
+	}
+
+	input := &route53.ListResourceRecordSetsInput{
+		HostedZoneId: hostedZoneID,
+	}
+
+	output, err := r.Route53Svc.ListResourceRecordSets(input)
+	if err != nil {
+		return nil, err
+	}
+
+	records := []*route53.ResourceRecordSet{}
+
+	for _, record := range output.ResourceRecordSets {
+		if *record.Name == fullyQualifiedHostname && *record.Type == "A" {
+			records = append(records, record)
+		}
+		if *record.Name == fullyQualifiedHostname && *record.Type == "TXT" {
+			records = append(records, record)
+		}
+	}
+	return records, nil
 }
 
 func (r *VpcEndpointServiceReconciler) createVpcEndpoint(vpcID, serviceName *string, vpcEndpointService *ec2.ServiceConfiguration) (*ec2.VpcEndpoint, error) {
@@ -476,7 +506,8 @@ func (r *VpcEndpointServiceReconciler) handleReconcileError(format string, param
 	return ctrl.Result{}, nil
 }
 
-func (r *VpcEndpointServiceReconciler) createDNSRecord(hostname, hostedZoneID *string, vpcEndpoint *ec2.VpcEndpoint) (*route53.ChangeResourceRecordSetsOutput, error) {
+func (r *VpcEndpointServiceReconciler) createDNSRecord(hostname, hostedZoneID, serviceName *string, vpcEndpoint *ec2.VpcEndpoint) (*route53.ChangeResourceRecordSetsOutput, error) {
+	tags := fmt.Sprintf("\"Owner=%s;Service=%s\"", *r.Cluster.Name, *serviceName)
 
 	input := &route53.ChangeResourceRecordSetsInput{
 		ChangeBatch: &route53.ChangeBatch{
@@ -491,6 +522,19 @@ func (r *VpcEndpointServiceReconciler) createDNSRecord(hostname, hostedZoneID *s
 						},
 						Name: aws.String(*hostname),
 						Type: aws.String("A"),
+					},
+				},
+				{
+					Action: aws.String("CREATE"),
+					ResourceRecordSet: &route53.ResourceRecordSet{
+						Name: aws.String(*hostname),
+						Type: aws.String("TXT"),
+						TTL:  aws.Int64(30),
+						ResourceRecords: []*route53.ResourceRecord{
+							{
+								Value: aws.String(tags),
+							},
+						},
 					},
 				},
 			},
@@ -522,16 +566,17 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	err = r.waitForLoadBalancer(svc)
 	if err != nil {
-		return r.handleReconcileError("error waiting for LB to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String())
+		return r.handleReconcileError("error waiting for load balancer to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String())
 	}
 	loadBalancers, err := r.getSvcLoadBalancersFromAWS(svc)
 	if err != nil {
-		return r.handleReconcileError("error: can't provision endpoint for %s load balancer. %s", svc.Name, err.Error())
+		return r.handleReconcileError("error can't provision VPC endpoint for %s load balancer. %s", svc.Name, err.Error())
 	}
 	arns, err := getLoadBalancerARNs(loadBalancers)
 	if err != nil {
 		return r.handleReconcileError("error getting load balancer ARN, %s", err.Error())
 	}
+
 	vpcEndpointService, err := r.getVpcEndpointService(&svc.Name)
 	if vpcEndpointService == nil || err != nil {
 		vpcEndpointService, err = r.createVpcEndpointService(arns, &svc.Name)
@@ -542,15 +587,15 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 		if err != nil {
 			return r.handleReconcileError("error waiting for VPC endpoint service to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String())
 		}
-		r.Log.Info(fmt.Sprintf("Endpoint service %s created", *vpcEndpointService.ServiceName))
+		r.Log.Info(fmt.Sprintf("VPC Endpoint service %s for kube service %s created", *vpcEndpointService.ServiceName, svc.Name))
 	} else {
 		r.Log.Info(fmt.Sprintf("VPC Endpoint service %s for kube service %s already exists", *vpcEndpointService.ServiceId, svc.Name))
 	}
 	if vpcID == "" {
-		return r.handleReconcileError("no endpoint vpc id found in annotations, skipping service %s", svc.Name)
+		return r.handleReconcileError("no VPC ID found in annotations, skipping kube service %s", svc.Name)
 	}
-	vpcEndpoint, err := r.getVpcEndpoint(vpcEndpointService.ServiceName)
 
+	vpcEndpoint, err := r.getVpcEndpoint(vpcEndpointService.ServiceName)
 	if vpcEndpoint == nil || err != nil {
 		vpcEndpoint, err := r.createVpcEndpoint(&vpcID, &svc.Name, vpcEndpointService)
 		if err != nil {
@@ -560,16 +605,28 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 		if err != nil {
 			return r.handleReconcileError("error waiting for VPC endpoint to initialise: %s. giving up after %s", err.Error(), DefaultMaxElapsedTime.String())
 		}
-		r.Log.Info(fmt.Sprintf("VPC Endpoint %s created", *vpcEndpoint.VpcEndpointId))
+		r.Log.Info(fmt.Sprintf("VPC Endpoint %s for kube service %s created", *vpcEndpoint.VpcEndpointId, svc.Name))
+	} else {
+		r.Log.Info(fmt.Sprintf("VPC Endpoint %s for kube service %s already exists", *vpcEndpoint.VpcEndpointId, svc.Name))
 	}
 	if hostname == "" || hostedZoneID == "" {
-		return r.handleReconcileError("no endpoint vpc id found in annotations, skipping service %s", svc.Name)
+		return r.handleReconcileError("no VPC endpoint ID found in annotations, skipping kube service %s", svc.Name)
 	}
-	_, err = r.createDNSRecord(&hostname, &hostedZoneID, vpcEndpoint)
+
+	records, err := r.getDNSRecords(&hostname, &hostedZoneID)
 	if err != nil {
-		return r.handleReconcileError("error creating DNS record for endpoint %s, %s", *vpcEndpoint.VpcEndpointId, err.Error())
+		return r.handleReconcileError("error getting DNS records for VPC endpoint %s, %s", *vpcEndpoint.VpcEndpointId, err.Error())
 	}
-	r.Log.Info(fmt.Sprintf("DNS record service %s created", hostname))
+	if len(records) == 0 {
+		_, err = r.createDNSRecord(&hostname, &hostedZoneID, &svc.Name, vpcEndpoint)
+		if err != nil {
+			return r.handleReconcileError("error creating DNS records for VPC endpoint %s, %s", *vpcEndpoint.VpcEndpointId, err.Error())
+		}
+		r.Log.Info(fmt.Sprintf("DNS records for %s for kube service %s created", hostname, svc.Name))
+	} else {
+		r.Log.Info(fmt.Sprintf("DNS records for %s for kube service %s already exist", hostname, svc.Name))
+	}
+
 	return ctrl.Result{}, nil
 }
 
