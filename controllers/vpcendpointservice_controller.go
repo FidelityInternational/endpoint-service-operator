@@ -314,27 +314,36 @@ func (r *VpcEndpointServiceReconciler) getVpcEndpointService(serviceName *string
 		return nil, err
 	}
 	if vpcEndpointService.ServiceConfigurations == nil {
-		return nil, fmt.Errorf("No VPC Endpoint service for kube service %s found", *serviceName)
+		r.Log.Info(fmt.Sprintf("No VPC Endpoint service for kube service %s found", *serviceName))
+		return nil, nil
 	}
 	return vpcEndpointService.ServiceConfigurations[0], nil
 }
 
 func (r *VpcEndpointServiceReconciler) getVpcEndpoint(serviceName *string) (*ec2.VpcEndpoint, error) {
-	filterName := "service-name"
-	filterValue := []*string{serviceName}
-	filter := ec2.Filter{
-		Name:   &filterName,
-		Values: filterValue,
+	clusterFilterName := "tag:Name"
+	clusterFilterValue := []*string{r.Cluster.Name}
+	clusterFilter := ec2.Filter{
+		Name:   &clusterFilterName,
+		Values: clusterFilterValue,
+	}
+	serviceFilterName := "tag:Service"
+	serviceFilterValue := []*string{serviceName}
+	serviceFilter := ec2.Filter{
+		Name:   &serviceFilterName,
+		Values: serviceFilterValue,
 	}
 	input := &ec2.DescribeVpcEndpointsInput{
-		Filters: []*ec2.Filter{&filter},
+		Filters: []*ec2.Filter{&clusterFilter, &serviceFilter},
 	}
+
 	output, err := r.Ec2Svc.DescribeVpcEndpoints(input)
 	if err != nil {
 		return nil, err
 	}
 	if output.VpcEndpoints == nil || *output.VpcEndpoints[0].State == "deleting" {
-		return nil, fmt.Errorf("No VPC Endpoint for service %s found", *serviceName)
+		r.Log.Info(fmt.Sprintf("No VPC Endpoint for service %s found", *serviceName))
+		return nil, nil
 	}
 	return output.VpcEndpoints[0], nil
 }
@@ -346,7 +355,6 @@ func (r *VpcEndpointServiceReconciler) getDNSRecords(hostname, hostedZoneID *str
 	if string(h[l-1]) != "." {
 		fullyQualifiedHostname = fmt.Sprintf("%s.", *hostname)
 	}
-
 	input := &route53.ListResourceRecordSetsInput{
 		HostedZoneId: hostedZoneID,
 	}
@@ -355,7 +363,6 @@ func (r *VpcEndpointServiceReconciler) getDNSRecords(hostname, hostedZoneID *str
 	if err != nil {
 		return nil, err
 	}
-
 	records := []*route53.ResourceRecordSet{}
 
 	for _, record := range output.ResourceRecordSets {
@@ -557,12 +564,7 @@ func (r *VpcEndpointServiceReconciler) createDNSRecord(hostname, hostedZoneID, s
 	return r.Route53Svc.ChangeResourceRecordSets(input)
 }
 
-func (r *VpcEndpointServiceReconciler) finalizeEndpoint(svc *v1.Service) error {
-	return nil
-}
-
-func (r *VpcEndpointServiceReconciler) updateEndpoint(svc *v1.Service) error {
-	var vpcID, hostname, hostedZoneID string
+func getSvcAnnotations(svc *v1.Service) (vpcID, hostname, hostedZoneID string) {
 	for key, value := range svc.Annotations {
 		if key == endpointAnnotationVpcID {
 			vpcID = value
@@ -574,7 +576,11 @@ func (r *VpcEndpointServiceReconciler) updateEndpoint(svc *v1.Service) error {
 			hostedZoneID = value
 		}
 	}
+	return vpcID, hostname, hostedZoneID
+}
 
+func (r *VpcEndpointServiceReconciler) updateEndpoint(svc *v1.Service) error {
+	vpcID, hostname, hostedZoneID := getSvcAnnotations(svc)
 	loadbalancers, err := r.waitForLoadBalancer(svc)
 	if err != nil {
 		return err
@@ -585,7 +591,10 @@ func (r *VpcEndpointServiceReconciler) updateEndpoint(svc *v1.Service) error {
 	}
 
 	vpcEndpointService, err := r.getVpcEndpointService(&svc.Name)
-	if vpcEndpointService == nil || err != nil {
+	if err != nil {
+		return err
+	}
+	if vpcEndpointService == nil {
 		vpcEndpointService, err = r.createVpcEndpointService(arns, &svc.Name)
 		if err != nil {
 			return fmt.Errorf("error creating VPC endpoint service, %s, service name: %s", err.Error(), svc.Name)
@@ -601,9 +610,11 @@ func (r *VpcEndpointServiceReconciler) updateEndpoint(svc *v1.Service) error {
 	if vpcID == "" {
 		return fmt.Errorf("no VPC ID found in annotations, skipping kube service %s", svc.Name)
 	}
-
-	vpcEndpoint, err := r.getVpcEndpoint(vpcEndpointService.ServiceName)
-	if vpcEndpoint == nil || err != nil {
+	vpcEndpoint, err := r.getVpcEndpoint(&svc.Name)
+	if err != nil {
+		return err
+	}
+	if vpcEndpoint == nil {
 		vpcEndpoint, err = r.createVpcEndpoint(&vpcID, &svc.Name, vpcEndpointService)
 		if err != nil {
 			return fmt.Errorf("error creating VPC endpoint, %s", err.Error())
@@ -619,7 +630,6 @@ func (r *VpcEndpointServiceReconciler) updateEndpoint(svc *v1.Service) error {
 	if hostname == "" || hostedZoneID == "" {
 		return fmt.Errorf("no VPC ID found in annotations, skipping kube service %s", svc.Name)
 	}
-
 	records, err := r.getDNSRecords(&hostname, &hostedZoneID)
 	if err != nil {
 		return fmt.Errorf("error getting DNS records for VPC endpoint %s, %s", *vpcEndpoint.VpcEndpointId, err.Error())
@@ -636,12 +646,112 @@ func (r *VpcEndpointServiceReconciler) updateEndpoint(svc *v1.Service) error {
 	return nil
 }
 
+func (r *VpcEndpointServiceReconciler) deleteDNSRecords(records []*route53.ResourceRecordSet, serviceName *string, hostedZoneID *string) error {
+	tags := fmt.Sprintf("\"Owner=%s;Service=%s\"", *r.Cluster.Name, *serviceName)
+	owned := false
+	for _, record := range records {
+		for _, resourceRecord := range record.ResourceRecords {
+			if *resourceRecord.Value == tags {
+				owned = true
+			}
+		}
+	}
+	if !owned {
+		return fmt.Errorf("DNS records for service %s found but we don't own them. Skipping deletion", *serviceName)
+	}
+	changes := []*route53.Change{}
+	for _, record := range records {
+		change := route53.Change{
+			Action: aws.String("DELETE"),
+			ResourceRecordSet: &route53.ResourceRecordSet{
+				Name: aws.String(*record.Name),
+				Type: aws.String(*record.Type),
+			},
+		}
+		if record.TTL != nil {
+			change.ResourceRecordSet.TTL = record.TTL
+		}
+		if record.AliasTarget != nil {
+			change.ResourceRecordSet.AliasTarget = record.AliasTarget
+		}
+		if record.ResourceRecords != nil {
+			change.ResourceRecordSet.ResourceRecords = record.ResourceRecords
+		}
+		changes = append(changes, &change)
+	}
+
+	input := &route53.ChangeResourceRecordSetsInput{
+		ChangeBatch: &route53.ChangeBatch{
+			Changes: changes,
+		},
+		HostedZoneId: aws.String(*hostedZoneID),
+	}
+	_, err := r.Route53Svc.ChangeResourceRecordSets(input)
+	return err
+}
+
+func (r *VpcEndpointServiceReconciler) deleteVpcEndPoint(vpcEndpoint *ec2.VpcEndpoint) error {
+	input := ec2.DeleteVpcEndpointsInput{
+		VpcEndpointIds: []*string{vpcEndpoint.VpcEndpointId},
+	}
+	_, err := r.Ec2Svc.DeleteVpcEndpoints(&input)
+	if err != nil {
+		return err
+	}
+	r.Log.Info(fmt.Sprintf("VPC Endpoint %s deleted", *vpcEndpoint.VpcEndpointId))
+	return nil
+}
+
+func (r *VpcEndpointServiceReconciler) deleteVpcEndPointService(vpcEndpointService *ec2.ServiceConfiguration) error {
+	input := ec2.DeleteVpcEndpointServiceConfigurationsInput{
+		ServiceIds: []*string{vpcEndpointService.ServiceId},
+	}
+	_, err := r.Ec2Svc.DeleteVpcEndpointServiceConfigurations(&input)
+	if err != nil {
+		return err
+	}
+	r.Log.Info(fmt.Sprintf("VPC Endpoint Service %s deleted", *vpcEndpointService.ServiceName))
+	return nil
+}
+
+func (r *VpcEndpointServiceReconciler) finalizeEndpoint(svc *v1.Service) error {
+	_, hostname, hostedZoneID := getSvcAnnotations(svc)
+	records, err := r.getDNSRecords(&hostname, &hostedZoneID)
+	if err != nil {
+		r.Log.Info(fmt.Sprintf("Skipping DNS record deletion for service %s: %s", svc.Name, err.Error()))
+	}
+	if len(records) == 2 {
+		err = r.deleteDNSRecords(records, &svc.Name, &hostedZoneID)
+		if err != nil {
+			r.Log.Info(err.Error())
+		}
+		r.Log.Info(fmt.Sprintf("DNS records for service %s deleted", svc.Name))
+	} else {
+		r.Log.Info(fmt.Sprintf("No DNS records for service %s found", svc.Name))
+	}
+	vpcEndpoint, err := r.getVpcEndpoint(&svc.Name)
+	if vpcEndpoint != nil {
+		err = r.deleteVpcEndPoint(vpcEndpoint)
+	}
+	if err != nil {
+		return err
+	}
+	vpcEndpointService, err := r.getVpcEndpointService(&svc.Name)
+	if vpcEndpointService != nil {
+		err = r.deleteVpcEndPointService(vpcEndpointService)
+	}
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 // Reconcile runs all logic related to the creation of endpoint services, endpoints and DNS records
 func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	svc := &v1.Service{}
 	if err := r.Client.Get(ctx, req.NamespacedName, svc); err != nil {
 		if errors.IsNotFound(err) {
-			r.Log.Info(fmt.Sprintf("Service resource %s not found. Ignoring since object must be deleted.", svc.Name))
+			r.Log.Info("Event received but service resource not found. Ignoring since object must be deleted.")
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -667,9 +777,7 @@ func (r *VpcEndpointServiceReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	if err := r.updateEndpoint(svc); err != nil {
-		return ctrl.Result{
-			RequeueAfter: 1 * time.Second,
-		}, err
+		r.Log.Info(err.Error())
 	}
 	return ctrl.Result{}, nil
 }
