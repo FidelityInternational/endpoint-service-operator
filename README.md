@@ -14,3 +14,19 @@ make run
 ```
 
 will start the operator. No coompiled or dockerized versions are available yet
+
+## supported annotations
+```
+vpc-endpoint-service-operator.fil.com/endpoint-vpc-id
+```
+A VPC ID that will host the endpoint
+
+```
+vpc-endpoint-service-operator.fil.com/hosted-zone-id
+```
+Hosted Zone ID that will be used to provision DNS records
+
+```
+vpc-endpoint-service-operator.fil.com/hostname
+```
+Endpont FQDN
